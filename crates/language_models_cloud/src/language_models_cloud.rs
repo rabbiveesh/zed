@@ -426,6 +426,10 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
                     .as_ref()
                     .and_then(|effort| anthropic::Effort::from_str(effort).ok());
 
+                // TEMP probe (#58063): captured before `request` is consumed so the
+                // ledger can drop summarization/title-gen requests.
+                let probe_intent = format!("{:?}", request.intent);
+
                 let mut request = into_anthropic(
                     request,
                     self.model.id.to_string(),
@@ -451,6 +455,40 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
                 if !self.model.supports_fast_mode {
                     request.speed = None;
                 }
+
+                // TEMP probe (#58063): build a self-correlating record for this
+                // request. `probe_prefix` carries the request shape (seq, prompt_id,
+                // intent, block + tool-call counts); the response's cc/cr is appended
+                // in the stream tap below, so each ledger line pairs a request with
+                // its own cache result — no log-alignment guessing. The full request
+                // is also written to req-NNN.json for prefix diffs.
+                let probe_prefix = {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static REQUEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+                    let seq = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let blocks: usize = request.messages.iter().map(|m| m.content.len()).sum();
+                    let tool_use = request
+                        .messages
+                        .iter()
+                        .flat_map(|m| &m.content)
+                        .filter(|block| matches!(block, anthropic::RequestContent::ToolUse { .. }))
+                        .count();
+                    if let Some(home) = std::env::var_os("HOME") {
+                        let dir = std::path::Path::new(&home).join("zed-cache-probe");
+                        std::fs::create_dir_all(&dir).ok();
+                        if let Ok(json) = serde_json::to_string_pretty(&request) {
+                            std::fs::write(dir.join(format!("req-{seq:03}.json")), json).ok();
+                        }
+                    }
+                    format!(
+                        r#""seq":{},"prompt_id":"{}","intent":"{}","blocks":{},"tool_use":{}"#,
+                        seq,
+                        prompt_id.as_deref().unwrap_or(""),
+                        probe_intent,
+                        blocks,
+                        tool_use,
+                    )
+                };
 
                 let http_client = self.http_client.clone();
                 let token_provider = self.token_provider.clone();
@@ -480,11 +518,34 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
                     })?;
 
                     let mut mapper = AnthropicEventMapper::new();
-                    Ok(map_cloud_completion_events(
+                    let events = map_cloud_completion_events(
                         Box::pin(response_lines(response, includes_status_messages)),
                         &provider_name,
                         move |event| mapper.map_event(event),
-                    ))
+                    );
+                    // TEMP probe (#58063): append this request's cache result,
+                    // paired with its shape, as one ledger line.
+                    Ok(events
+                        .inspect(move |item| {
+                            if let Ok(LanguageModelCompletionEvent::UsageUpdate(usage)) = item
+                                && let Some(home) = std::env::var_os("HOME")
+                                && let Ok(mut file) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(std::path::Path::new(&home).join("zed-cache-probe/ledger.jsonl"))
+                            {
+                                use std::io::Write as _;
+                                writeln!(
+                                    file,
+                                    "{{{},\"cc\":{},\"cr\":{}}}",
+                                    probe_prefix,
+                                    usage.cache_creation_input_tokens,
+                                    usage.cache_read_input_tokens,
+                                )
+                                .ok();
+                            }
+                        })
+                        .boxed())
                 });
                 async move { Ok(future.await?.boxed()) }.boxed()
             }

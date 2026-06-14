@@ -24,14 +24,18 @@ pub enum AnthropicPromptCacheMode {
     Automatic,
 }
 
+/// How many conversation cache breakpoints to place. Anthropic allows 4 cache
+/// breakpoints per request; one is reserved for the long-lived tools/system
+/// anchor, leaving three for the conversation — spent on the conversation tail
+/// plus the most recent stable turn boundaries.
+const CONVERSATION_CACHE_BREAKPOINTS: usize = 3;
+
 fn set_cache_control(content: &mut RequestContent, cache_control: Option<CacheControl>) -> bool {
     match content {
-        RequestContent::RedactedThinking { .. } => false,
+        // Anthropic rejects `cache_control` on (redacted) thinking blocks
+        // ("Extra inputs are not permitted"), so these can't hold a breakpoint.
+        RequestContent::RedactedThinking { .. } | RequestContent::Thinking { .. } => false,
         RequestContent::Text {
-            cache_control: target,
-            ..
-        }
-        | RequestContent::Thinking {
             cache_control: target,
             ..
         }
@@ -216,20 +220,23 @@ pub fn into_anthropic(
         }
     }
 
-    // When caching is enabled, mark the static prefix (tools + system) with an
-    // explicit long-TTL breakpoint, and let Anthropic's automatic top-level
-    // cache_control handle the short-TTL conversation breakpoint. Anthropic
-    // requires that longer TTLs appear earlier in the prefix, and the prefix
-    // order is tools → system → messages, so long-TTL tools/system before a
-    // short-TTL conversation breakpoint is a valid mix.
-    let long_lived_cache = (cache_mode == AnthropicPromptCacheMode::Automatic
-        && any_message_wants_cache)
-        .then_some(CacheControl {
-            cache_type: CacheControlType::Ephemeral,
-            ttl: Some(CacheTtl::OneHour),
-        });
+    // When caching is enabled, anchor the static prefix (tools + system) with a
+    // single explicit long-TTL breakpoint. A breakpoint on the system block
+    // caches tools + system together (the prefix renders tools → system →
+    // messages), so a separate tool breakpoint is only needed when there is no
+    // system prompt. Spending just one breakpoint here frees the rest for the
+    // conversation. Anthropic requires longer TTLs to appear earlier in the
+    // prefix, and the long-TTL prefix anchor precedes the short-TTL conversation
+    // breakpoints below, so the mix is valid.
+    let caching_enabled =
+        cache_mode == AnthropicPromptCacheMode::Automatic && any_message_wants_cache;
+    let long_lived_cache = caching_enabled.then_some(CacheControl {
+        cache_type: CacheControlType::Ephemeral,
+        ttl: Some(CacheTtl::OneHour),
+    });
 
-    let system = if system_message.is_empty() {
+    let has_system_prompt = !system_message.is_empty();
+    let system = if !has_system_prompt {
         None
     } else if let Some(cache_control) = long_lived_cache {
         Some(StringOrContents::Content(vec![RequestContent::Text {
@@ -252,9 +259,112 @@ pub fn into_anthropic(
         })
         .collect();
     if let Some(cache_control) = long_lived_cache
+        && !has_system_prompt
         && let Some(last_tool) = tools.last_mut()
     {
         last_tool.cache_control = Some(cache_control);
+    }
+
+    // Place short-TTL conversation breakpoints on stable turn boundaries plus
+    // the conversation tail.
+    //
+    // A turn boundary — the last block of the assistant/tool message before a
+    // real user prompt — is a byte-stable absolute position: later turns are
+    // only appended after it, so its prefix never changes and a breakpoint there
+    // re-lands on the exact block (and prefix hash) an earlier request wrote.
+    // That lets a turn which appends a large batch of parallel tool calls read
+    // the whole prior conversation through a boundary instead of rewriting it.
+    //
+    // We keep the *last few* boundaries, not just the most recent one, because
+    // Anthropic's cache has read-after-write latency: an entry written by the
+    // immediately-preceding request is not yet readable by the very next request
+    // (confirmed empirically — a breakpoint on the exact just-written block with
+    // a byte-identical prefix still missed, and only hit a request later). If we
+    // anchored solely on the most recent boundary, the turn right after a big
+    // batch would find that boundary still "fresh", fall all the way back to the
+    // system prefix, and re-create the entire conversation (a partial #58063
+    // regression). An older boundary is already committed, so it reliably reads
+    // the bulk of the conversation; only the newest, not-yet-committed blocks are
+    // re-created, and they read back a turn later (#58063).
+    if caching_enabled {
+        // Thinking blocks can't hold a breakpoint, so track which absolute
+        // positions are markable and snap each target onto the nearest markable
+        // block at or before it.
+        let markable: Vec<bool> = new_messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .map(|block| {
+                matches!(
+                    block,
+                    RequestContent::Text { .. }
+                        | RequestContent::Image { .. }
+                        | RequestContent::ToolUse { .. }
+                        | RequestContent::ToolResult { .. }
+                )
+            })
+            .collect();
+        let addresses: Vec<(usize, usize)> = new_messages
+            .iter()
+            .enumerate()
+            .flat_map(|(message_ix, message)| {
+                (0..message.content.len()).map(move |block_ix| (message_ix, block_ix))
+            })
+            .collect();
+        let snap = |pos: usize| (0..=pos).rev().find(|&ix| markable[ix]);
+
+        if let Some(last) = addresses.len().checked_sub(1).and_then(|ix| snap(ix)) {
+            // First absolute block index of each message.
+            let mut message_start = Vec::with_capacity(new_messages.len());
+            let mut offset = 0;
+            for message in &new_messages {
+                message_start.push(offset);
+                offset += message.content.len();
+            }
+
+            // The tail of the turn before each real user prompt, snapped onto a
+            // markable block. These are the stable boundaries we anchor on.
+            let mut boundaries: Vec<usize> = new_messages
+                .iter()
+                .enumerate()
+                .filter_map(|(message_ix, message)| {
+                    let is_user_prompt = message.role == crate::Role::User
+                        && message
+                            .content
+                            .iter()
+                            .any(|block| matches!(block, RequestContent::Text { .. }));
+                    let turn_start = (is_user_prompt && message_ix > 0).then_some(message_ix)?;
+                    let previous = turn_start - 1;
+                    let previous_tail = message_start[previous]
+                        + new_messages[previous].content.len().checked_sub(1)?;
+                    snap(previous_tail)
+                })
+                .collect();
+            boundaries.dedup();
+
+            // Reserve one breakpoint for the conversation tail (so the newest
+            // blocks are written for a later turn to read) and spend the rest on
+            // the most recent boundaries.
+            let kept_boundaries = CONVERSATION_CACHE_BREAKPOINTS.saturating_sub(1);
+            let mut breakpoints: Vec<usize> = boundaries
+                .into_iter()
+                .rev()
+                .take(kept_boundaries)
+                .chain(std::iter::once(last))
+                .collect();
+            breakpoints.sort_unstable();
+            breakpoints.dedup();
+
+            for position in breakpoints {
+                let (message_ix, block_ix) = addresses[position];
+                set_cache_control(
+                    &mut new_messages[message_ix].content[block_ix],
+                    Some(CacheControl {
+                        cache_type: CacheControlType::Ephemeral,
+                        ttl: None,
+                    }),
+                );
+            }
+        }
     }
 
     crate::Request {
@@ -262,16 +372,10 @@ pub fn into_anthropic(
         messages: new_messages,
         max_tokens: max_output_tokens,
         system,
-        // Opt into Anthropic's automatic prompt caching for the conversation
-        // tail. Omitting `ttl` uses the default (short) TTL, which refreshes
-        // for free on every cache hit — ideal for the rapidly-changing
-        // conversation suffix.
-        cache_control: (cache_mode == AnthropicPromptCacheMode::Automatic
-            && any_message_wants_cache)
-            .then_some(CacheControl {
-                cache_type: CacheControlType::Ephemeral,
-                ttl: None,
-            }),
+        // Conversation caching is handled by the explicit rolling breakpoints
+        // placed on the messages above, so the top-level automatic breakpoint is
+        // left unset to stay within Anthropic's 4-breakpoint budget.
+        cache_control: None,
         thinking: if request.thinking_allowed {
             match mode {
                 AnthropicModelMode::Thinking { budget_tokens } => {
@@ -529,7 +633,7 @@ mod tests {
     use language_model_core::{LanguageModelImage, LanguageModelRequestMessage, MessageContent};
 
     #[test]
-    fn test_caching_uses_top_level_auto_and_long_lived_prefix() {
+    fn test_caching_anchors_system_and_rolls_conversation_breakpoints() {
         let request = LanguageModelRequest {
             messages: vec![
                 LanguageModelRequestMessage {
@@ -575,33 +679,37 @@ mod tests {
             AnthropicPromptCacheMode::Automatic,
         );
 
-        // No message content block should carry cache_control anymore; the
-        // conversation breakpoint is set via top-level automatic caching.
+        // The conversation tail carries an explicit short-TTL breakpoint, and
+        // every conversation breakpoint is a short-TTL ephemeral marker.
         assert_eq!(anthropic_request.messages.len(), 1);
-        for block in &anthropic_request.messages[0].content {
-            let cache_control = match block {
-                RequestContent::Text { cache_control, .. }
-                | RequestContent::Thinking { cache_control, .. }
-                | RequestContent::Image { cache_control, .. }
-                | RequestContent::ToolUse { cache_control, .. }
-                | RequestContent::ToolResult { cache_control, .. } => *cache_control,
-                RequestContent::RedactedThinking { .. } => None,
-            };
-            assert!(
-                cache_control.is_none(),
-                "message content blocks should no longer be individually marked",
-            );
-        }
+        let content = &anthropic_request.messages[0].content;
+        let cache_control_of = |block: &RequestContent| match block {
+            RequestContent::Text { cache_control, .. }
+            | RequestContent::Thinking { cache_control, .. }
+            | RequestContent::Image { cache_control, .. }
+            | RequestContent::ToolUse { cache_control, .. }
+            | RequestContent::ToolResult { cache_control, .. } => *cache_control,
+            RequestContent::RedactedThinking { .. } => None,
+        };
+        assert!(
+            matches!(
+                cache_control_of(content.last().expect("message has content")),
+                Some(CacheControl {
+                    cache_type: CacheControlType::Ephemeral,
+                    ttl: None,
+                })
+            ),
+            "the conversation tail should carry a short-TTL breakpoint",
+        );
+        let marked = content.iter().filter(|b| cache_control_of(b).is_some()).count();
+        assert!(
+            marked >= 1 && marked <= CONVERSATION_CACHE_BREAKPOINTS,
+            "expected up to {CONVERSATION_CACHE_BREAKPOINTS} conversation breakpoints, got {marked}",
+        );
 
-        // Top-level cache_control opts into automatic caching with the default
-        // 5-minute TTL for the conversation tail.
-        assert!(matches!(
-            anthropic_request.cache_control,
-            Some(CacheControl {
-                cache_type: CacheControlType::Ephemeral,
-                ttl: None,
-            })
-        ));
+        // The top-level automatic breakpoint is no longer used; conversation
+        // caching is handled by the explicit breakpoints above.
+        assert!(anthropic_request.cache_control.is_none());
 
         // System prompt is emitted in array form with a long-TTL breakpoint on
         // the final text block.
@@ -622,15 +730,374 @@ mod tests {
             other => panic!("expected system content array, got {other:?}"),
         }
 
-        // The last (and only) tool carries a long-TTL breakpoint.
+        // With a system prompt present, the system breakpoint already caches
+        // tools + system together, so no separate tool breakpoint is spent.
         assert_eq!(anthropic_request.tools.len(), 1);
-        assert!(matches!(
-            anthropic_request.tools[0].cache_control,
-            Some(CacheControl {
-                cache_type: CacheControlType::Ephemeral,
-                ttl: Some(CacheTtl::OneHour),
+        assert!(anthropic_request.tools[0].cache_control.is_none());
+    }
+
+    /// Helpers shared by the breakpoint-placement tests.
+    fn block_is_marked(block: &RequestContent) -> bool {
+        matches!(
+            block,
+            RequestContent::Text { cache_control: Some(_), .. }
+                | RequestContent::Thinking { cache_control: Some(_), .. }
+                | RequestContent::Image { cache_control: Some(_), .. }
+                | RequestContent::ToolUse { cache_control: Some(_), .. }
+                | RequestContent::ToolResult { cache_control: Some(_), .. }
+        )
+    }
+
+    fn marked_block_indices(request: &crate::Request) -> Vec<usize> {
+        request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .enumerate()
+            .filter_map(|(ix, block)| block_is_marked(block).then_some(ix))
+            .collect()
+    }
+
+    fn parallel_batch(
+        text: &str,
+        count: usize,
+    ) -> (Vec<MessageContent>, Vec<MessageContent>) {
+        use language_model_core::{
+            LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolUse,
+        };
+        let mut assistant = vec![MessageContent::Text(text.to_string())];
+        let mut results = Vec::new();
+        for i in 0..count {
+            let id = format!("tool_{i}");
+            assistant.push(MessageContent::ToolUse(LanguageModelToolUse {
+                id: id.clone().into(),
+                name: "read_file".into(),
+                raw_input: "{}".to_string(),
+                input: serde_json::json!({ "path": format!("src/file_{i}.rs") }),
+                is_input_complete: true,
+                thought_signature: None,
+            }));
+            results.push(MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: id.into(),
+                tool_name: "read_file".into(),
+                is_error: false,
+                content: vec![LanguageModelToolResultContent::Text("…file contents…".into())],
+                output: None,
+            }));
+        }
+        (assistant, results)
+    }
+
+    fn user_message(text: &str) -> LanguageModelRequestMessage {
+        LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![MessageContent::Text(text.to_string())],
+            cache: false,
+            reasoning_details: None,
+        }
+    }
+
+    fn assistant_message(content: Vec<MessageContent>) -> LanguageModelRequestMessage {
+        LanguageModelRequestMessage {
+            role: Role::Assistant,
+            content,
+            cache: false,
+            reasoning_details: None,
+        }
+    }
+
+    fn caching_request(messages: Vec<LanguageModelRequestMessage>) -> crate::Request {
+        let mut messages = messages;
+        if let Some(last) = messages.last_mut() {
+            last.cache = true;
+        }
+        let request = LanguageModelRequest {
+            messages,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
+            temperature: None,
+            tools: vec![language_model_core::LanguageModelRequestTool {
+                name: "read_file".into(),
+                description: "Reads a file.".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                use_input_streaming: false,
+            }],
+            tool_choice: None,
+            thinking_allowed: true,
+            thinking_effort: None,
+            speed: None,
+        };
+        into_anthropic(
+            request,
+            "claude-3-5-sonnet".to_string(),
+            0.7,
+            4096,
+            AnthropicModelMode::Default,
+            AnthropicPromptCacheMode::Automatic,
+        )
+    }
+
+    /// Fix for #58063: a turn that appends a big batch of parallel tool calls —
+    /// far more blocks than Anthropic's cache lookback window — still anchors on
+    /// the previous turn's stable boundary. A breakpoint on that boundary reads
+    /// the whole prior conversation regardless of the batch size, so only the new
+    /// blocks are written instead of the entire conversation being re-created.
+    #[test]
+    fn test_big_batch_turn_anchors_on_prior_boundary_and_tail() {
+        let (batch, results) = parallel_batch("Reading the files…", 30);
+        let anthropic_request = caching_request(vec![
+            LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![MessageContent::Text("You are helpful.".to_string())],
+                cache: false,
+                reasoning_details: None,
+            },
+            user_message("First question."),
+            assistant_message(vec![MessageContent::Text(
+                "Here is turn one's answer.".to_string(),
+            )]),
+            // Current turn: a new prompt, then a large parallel batch.
+            user_message("Now read a bunch of files."),
+            assistant_message(batch),
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: results,
+                cache: true,
+                reasoning_details: None,
+            },
+        ]);
+
+        let flat: Vec<&RequestContent> = anthropic_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .collect();
+        let breakpoints = marked_block_indices(&anthropic_request);
+
+        // The conversation tail is always marked so the new blocks are written.
+        assert_eq!(breakpoints.last(), Some(&(flat.len() - 1)));
+
+        // The previous turn's boundary (the tail of "turn one's answer") is also
+        // marked, across a gap far larger than the lookback window — the boundary
+        // is read by exact position, no chaining required.
+        let boundary_ix = flat
+            .iter()
+            .position(|block| {
+                matches!(block, RequestContent::Text { text, .. } if text.contains("turn one's answer"))
             })
-        ));
+            .expect("previous turn boundary present");
+        assert!(
+            breakpoints.contains(&boundary_ix),
+            "previous turn's boundary should be anchored (breakpoints: {breakpoints:?}, boundary: {boundary_ix})",
+        );
+        assert!(
+            breakpoints.len() <= CONVERSATION_CACHE_BREAKPOINTS,
+            "at most {CONVERSATION_CACHE_BREAKPOINTS} conversation breakpoints, got {breakpoints:?}",
+        );
+        assert!(anthropic_request.cache_control.is_none());
+    }
+
+    /// Fix for #58063 (the read-after-write case): a cache entry written by the
+    /// immediately-preceding request is not yet readable on the next request, so
+    /// anchoring on only the most recent boundary would make the turn right after
+    /// a big batch fall back to the system prefix and re-create the whole
+    /// conversation. We keep the last *several* boundaries, so an older, already
+    /// committed one is always available to read the bulk of the conversation.
+    #[test]
+    fn test_keeps_multiple_turn_boundaries() {
+        let (batch, results) = parallel_batch("Reading now…", 30);
+        let anthropic_request = caching_request(vec![
+            LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![MessageContent::Text("You are helpful.".to_string())],
+                cache: false,
+                reasoning_details: None,
+            },
+            user_message("First question."),
+            assistant_message(vec![MessageContent::Text("Turn one answer.".to_string())]),
+            user_message("Second question."),
+            assistant_message(vec![MessageContent::Text("Turn two answer.".to_string())]),
+            user_message("Now read a bunch of files."),
+            assistant_message(batch),
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: results,
+                cache: true,
+                reasoning_details: None,
+            },
+        ]);
+
+        let flat: Vec<&RequestContent> = anthropic_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .collect();
+        let breakpoints = marked_block_indices(&anthropic_request);
+
+        let boundary_of = |needle: &str| {
+            flat.iter()
+                .position(|block| {
+                    matches!(block, RequestContent::Text { text, .. } if text.contains(needle))
+                })
+                .unwrap_or_else(|| panic!("boundary {needle:?} present"))
+        };
+        // Both recent boundaries are anchored — the most recent (turn two) and the
+        // older, definitely-committed one (turn one) — plus the tail.
+        let recent_boundary = boundary_of("Turn two answer.");
+        let older_boundary = boundary_of("Turn one answer.");
+        assert!(
+            breakpoints.contains(&older_boundary),
+            "an older committed boundary must be kept for read-after-write fallback (breakpoints: {breakpoints:?})",
+        );
+        assert!(
+            breakpoints.contains(&recent_boundary),
+            "the most recent boundary should be anchored (breakpoints: {breakpoints:?})",
+        );
+        assert_eq!(breakpoints.last(), Some(&(flat.len() - 1)));
+        assert_eq!(
+            breakpoints.len(),
+            CONVERSATION_CACHE_BREAKPOINTS,
+            "expected tail + two boundaries, got {breakpoints:?}",
+        );
+    }
+
+    /// Regression test: Anthropic rejects `cache_control` on thinking blocks, so
+    /// breakpoints must never land on one. Verifies no thinking block is marked
+    /// even when thinking blocks sit on the boundaries we anchor.
+    #[test]
+    fn test_breakpoints_never_land_on_thinking_blocks() {
+        use language_model_core::{
+            LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolUse,
+        };
+
+        let thinking = || MessageContent::Thinking {
+            text: "deliberating…".to_string(),
+            signature: Some("sig".to_string()),
+        };
+
+        const PARALLEL_TOOL_CALLS: usize = 12;
+        let mut batch_content = vec![thinking(), MessageContent::Text("Working…".to_string())];
+        let mut tool_result_content = Vec::new();
+        for i in 0..PARALLEL_TOOL_CALLS {
+            let id = format!("tool_{i}");
+            batch_content.push(MessageContent::ToolUse(LanguageModelToolUse {
+                id: id.clone().into(),
+                name: "read_file".into(),
+                raw_input: "{}".to_string(),
+                input: serde_json::json!({ "path": format!("src/file_{i}.rs") }),
+                is_input_complete: true,
+                thought_signature: None,
+            }));
+            tool_result_content.push(MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: id.into(),
+                tool_name: "read_file".into(),
+                is_error: false,
+                content: vec![LanguageModelToolResultContent::Text("…contents…".into())],
+                output: None,
+            }));
+        }
+
+        let request = LanguageModelRequest {
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::System,
+                    content: vec![MessageContent::Text("You are helpful.".to_string())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("First question.".to_string())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![thinking(), MessageContent::Text("Turn one answer.".to_string())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("Now read the files.".to_string())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: batch_content,
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: tool_result_content,
+                    cache: true,
+                    reasoning_details: None,
+                },
+            ],
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
+            temperature: None,
+            tools: vec![language_model_core::LanguageModelRequestTool {
+                name: "read_file".into(),
+                description: "Reads a file.".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                use_input_streaming: false,
+            }],
+            tool_choice: None,
+            thinking_allowed: true,
+            thinking_effort: None,
+            speed: None,
+        };
+
+        let anthropic_request = into_anthropic(
+            request,
+            "claude-3-5-sonnet".to_string(),
+            0.7,
+            4096,
+            AnthropicModelMode::Default,
+            AnthropicPromptCacheMode::Automatic,
+        );
+
+        // The request must actually contain thinking blocks, and none may carry
+        // a cache_control field.
+        let mut saw_thinking = false;
+        let mut absolute_ix = 0usize;
+        let mut breakpoints = Vec::new();
+        for message in &anthropic_request.messages {
+            for block in &message.content {
+                match block {
+                    RequestContent::Thinking { cache_control, .. } => {
+                        saw_thinking = true;
+                        assert!(
+                            cache_control.is_none(),
+                            "cache_control must never be set on a thinking block",
+                        );
+                    }
+                    RequestContent::Text { cache_control: Some(_), .. }
+                    | RequestContent::Image { cache_control: Some(_), .. }
+                    | RequestContent::ToolUse { cache_control: Some(_), .. }
+                    | RequestContent::ToolResult { cache_control: Some(_), .. } => {
+                        breakpoints.push(absolute_ix);
+                    }
+                    _ => {}
+                }
+                absolute_ix += 1;
+            }
+        }
+        assert!(saw_thinking, "test should exercise thinking blocks");
+
+        // At least one breakpoint was placed (tail), and the conversation tail is
+        // marked — the thinking blocks on the boundaries were snapped past.
+        assert!(
+            !breakpoints.is_empty(),
+            "expected breakpoints to be placed",
+        );
     }
 
     #[test]

@@ -3017,6 +3017,18 @@ impl Thread {
                     cache_creation_input_tokens = usage.cache_creation_input_tokens,
                     cache_read_input_tokens = usage.cache_read_input_tokens,
                 );
+                // TEMP probe (#58063): per-request prompt-cache split. A healthy
+                // long thread should show cache_read climbing while cache_creation
+                // stays near zero on follow-ups; the bug shows cache_creation
+                // re-billing the whole prefix every turn.
+                eprintln!(
+                    "CACHE_PROBE msgs={} input={} cache_creation={} cache_read={} output={}",
+                    self.messages.len(),
+                    usage.input_tokens,
+                    usage.cache_creation_input_tokens,
+                    usage.cache_read_input_tokens,
+                    usage.output_tokens,
+                );
                 self.update_token_usage(usage, cx);
             }
             Stop(StopReason::Refusal) => return Err(CompletionError::Refusal.into()),

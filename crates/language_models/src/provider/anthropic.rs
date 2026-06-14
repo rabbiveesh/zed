@@ -525,6 +525,9 @@ impl LanguageModel for AnthropicModel {
     > {
         let has_tools = !request.tools.is_empty();
         let request_id = self.model.request_id(has_tools).to_string();
+        // TEMP probe (#58063): captured before `request` is consumed.
+        let probe_intent = format!("{:?}", request.intent);
+        let probe_prompt_id = request.prompt_id.clone();
         let mut request = into_anthropic(
             request,
             request_id,
@@ -536,10 +539,64 @@ impl LanguageModel for AnthropicModel {
         if !self.model.supports_speed {
             request.speed = None;
         }
+
+        // TEMP probe (#58063): self-correlating per-request ledger for the DIRECT
+        // Anthropic path (where our cache_control breakpoints actually reach
+        // Anthropic). Pairs each request's shape with its own cc/cr in
+        // ~/zed-cache-probe/ledger.jsonl; full request in req-NNN.json.
+        let probe_prefix = {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static REQUEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let seq = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let blocks: usize = request.messages.iter().map(|m| m.content.len()).sum();
+            let tool_use = request
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .filter(|block| matches!(block, anthropic::RequestContent::ToolUse { .. }))
+                .count();
+            if let Some(home) = std::env::var_os("HOME") {
+                let dir = std::path::Path::new(&home).join("zed-cache-probe");
+                std::fs::create_dir_all(&dir).ok();
+                if let Ok(json) = serde_json::to_string_pretty(&request) {
+                    std::fs::write(dir.join(format!("req-{seq:03}.json")), json).ok();
+                }
+            }
+            format!(
+                r#""seq":{},"prompt_id":"{}","intent":"{}","blocks":{},"tool_use":{}"#,
+                seq,
+                probe_prompt_id.as_deref().unwrap_or(""),
+                probe_intent,
+                blocks,
+                tool_use,
+            )
+        };
+
         let request = self.stream_completion(request, cx);
         let future = self.request_limiter.stream(async move {
             let response = request.await?;
-            Ok(AnthropicEventMapper::new().map_stream(response))
+            let events = AnthropicEventMapper::new().map_stream(response);
+            Ok(events
+                .inspect(move |item| {
+                    if let Ok(LanguageModelCompletionEvent::UsageUpdate(usage)) = item
+                        && let Some(home) = std::env::var_os("HOME")
+                        && let Ok(mut file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(std::path::Path::new(&home).join("zed-cache-probe/ledger.jsonl"))
+                    {
+                        use std::io::Write as _;
+                        writeln!(
+                            file,
+                            "{{{},\"cc\":{},\"cr\":{}}}",
+                            probe_prefix,
+                            usage.cache_creation_input_tokens,
+                            usage.cache_read_input_tokens,
+                        )
+                        .ok();
+                    }
+                })
+                .boxed())
         });
         async move { Ok(future.await?.boxed()) }.boxed()
     }
