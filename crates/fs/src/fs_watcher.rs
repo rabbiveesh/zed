@@ -411,19 +411,6 @@ fn push_notify_event(
     watched_root: &Path,
     event: &notify::Event,
 ) {
-    // TEMP probe (#25843 investigation): sample the watcher event rate + source.
-    {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static EVENT_COUNT: AtomicUsize = AtomicUsize::new(0);
-        let n = EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n % 1000 == 0 {
-            eprintln!(
-                "FSWATCH_PROBE n={n} kind={:?} watched_root={watched_root:?} event_path={:?}",
-                event.kind,
-                event.paths.first(),
-            );
-        }
-    }
     let kind = match event.kind {
         EventKind::Create(_) => Some(PathEventKind::Created),
         EventKind::Modify(_) => Some(PathEventKind::Changed),
