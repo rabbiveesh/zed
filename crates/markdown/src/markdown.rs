@@ -1981,6 +1981,7 @@ impl Element for MarkdownElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let _layout_probe = gpui::cpu_probe::time("markdown.request_layout");
         let mut builder = MarkdownElementBuilder::new(
             &self.style.container_style,
             self.style.base_text_style.clone(),
@@ -2739,6 +2740,113 @@ impl Element for MarkdownElement {
     }
 }
 
+/// Estimated height of a not-yet-measured markdown block, used to size the cheap
+/// leaf that stands in for an off-screen block in the parent column.
+const ESTIMATED_BLOCK_HEIGHT: Pixels = px(40.);
+
+/// How far above/below the visible viewport to keep blocks laid out, so quick
+/// scrolls don't reveal unpainted gaps.
+const BLOCK_OVERSCAN: Pixels = px(800.);
+
+/// Counts how many top-level blocks were actually laid out (i.e. on-screen) in
+/// the current draw, so tests can assert layout cost is bounded by the viewport
+/// rather than the document length.
+#[cfg(test)]
+pub(crate) static BLOCKS_LAID_OUT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Wraps a single top-level markdown block and defers its (expensive) layout and
+/// paint to `prepaint`, doing them only when the block intersects the visible
+/// `content_mask`. Off-screen blocks contribute a single cheap leaf node, so
+/// per-frame taffy work is bounded by the viewport rather than the document
+/// length (issue #57349).
+struct CulledBlock {
+    child: AnyElement,
+    height_hint: Pixels,
+}
+
+impl CulledBlock {
+    fn new(child: AnyElement) -> Self {
+        Self {
+            child,
+            height_hint: ESTIMATED_BLOCK_HEIGHT,
+        }
+    }
+}
+
+impl Element for CulledBlock {
+    type RequestLayoutState = ();
+    type PrepaintState = bool;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, ()) {
+        let mut style = gpui::Style::default();
+        style.size.width = Length::Definite(gpui::relative(1.));
+        style.size.height = Length::Definite(self.height_hint.into());
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let visible = window.content_mask().bounds.dilate(BLOCK_OVERSCAN);
+        if !bounds.intersects(&visible) {
+            return false;
+        }
+        #[cfg(test)]
+        BLOCKS_LAID_OUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let available = gpui::size(
+            gpui::AvailableSpace::Definite(bounds.size.width),
+            gpui::AvailableSpace::MinContent,
+        );
+        self.child.layout_as_root(available, window, cx);
+        self.child.prepaint_at(bounds.origin, window, cx);
+        true
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        visible: &mut bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if *visible {
+            self.child.paint(window, cx);
+        }
+    }
+}
+
+impl IntoElement for CulledBlock {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
 fn collect_image_alt_text(
     events_from_image_start: &[(Range<usize>, MarkdownEvent)],
     source: &str,
@@ -3164,7 +3272,13 @@ impl MarkdownElementBuilder {
     fn pop_div(&mut self) {
         self.flush_text();
         let div = self.div_stack.pop().unwrap().into_any_element();
-        self.div_stack.last_mut().unwrap().extend(iter::once(div));
+        if self.div_stack.len() == 1 {
+            // Top-level block: wrap it so off-screen blocks skip layout/paint.
+            let block = CulledBlock::new(div).into_any_element();
+            self.div_stack.last_mut().unwrap().extend(iter::once(block));
+        } else {
+            self.div_stack.last_mut().unwrap().extend(iter::once(div));
+        }
     }
 
     fn push_sourced_element(&mut self, source_range: Range<usize>, element: impl Into<AnyElement>) {
@@ -3631,6 +3745,12 @@ impl RenderedText {
                 continue;
             }
 
+            // Off-screen (culled) lines have no geometry this frame, and
+            // `wrapped_line_segments` calls `bounds()`, which would panic on
+            // them; their selection/search rects simply aren't drawn (#57349).
+            if line.layout.bounds_opt().is_none() {
+                continue;
+            }
             let wrapped_line_segments = Self::wrapped_line_segments(line);
             if wrapped_line_segments.is_empty() {
                 continue;
@@ -3760,7 +3880,11 @@ impl RenderedText {
         let mut fallback_line: Option<&RenderedLine> = None;
 
         while let Some(line) = lines.next() {
-            let line_bounds = line.layout.bounds();
+            // Skip lines that weren't laid out this frame (off-screen / culled),
+            // so they have no geometry to query (issue #57349 virtualization).
+            let Some(line_bounds) = line.layout.bounds_opt() else {
+                continue;
+            };
 
             // Exact match: position is within bounds (handles overlapping bounds like table columns)
             if line_bounds.contains(&position) {
@@ -3775,7 +3899,8 @@ impl RenderedText {
             // Handle gap between lines
             if position.y > line_bounds.bottom() {
                 if let Some(next_line) = lines.peek()
-                    && position.y < next_line.layout.bounds().top()
+                    && let Some(next_bounds) = next_line.layout.bounds_opt()
+                    && position.y < next_bounds.top()
                 {
                     return Err(line.source_end);
                 }
@@ -3798,6 +3923,8 @@ impl RenderedText {
             } else if source_index > line.source_end {
                 continue;
             } else {
+                // The target line is off-screen (culled) and has no geometry.
+                line.layout.bounds_opt()?;
                 let line_height = line.layout.line_height();
                 let rendered_index_within_line = line.rendered_index_for_source_index(source_index);
                 let position = line.layout.position_for_index(rendered_index_within_line)?;
@@ -3932,6 +4059,214 @@ mod tests {
                 theme_settings::init(theme::LoadThemes::JustBase, cx);
             }
         });
+    }
+
+    /// Build a markdown doc with `blocks` blank-line-separated top-level blocks
+    /// (headings, wrapping prose, fenced code, lists, quotes) to exercise the
+    /// per-frame layout cost the way a long agent response does (issue #57349).
+    fn perf_doc(blocks: usize) -> String {
+        let mut out = String::new();
+        for i in 0..blocks {
+            match i % 6 {
+                0 => out.push_str(&format!("## Heading {i}")),
+                1 | 2 => out.push_str(&format!(
+                    "Paragraph {i} with **bold**, `code`, and a [link](https://example.com) plus \
+                     filler words to make it wrap across the viewport at least once or twice over."
+                )),
+                3 => out.push_str(&format!("- bullet {i} a\n- bullet {i} b")),
+                4 => out.push_str(&format!("```rust\nfn f_{i}() {{ let x = {i}; x + 1 }}\n```")),
+                _ => out.push_str(&format!("> quote {i} with a little extra text so it wraps")),
+            }
+            out.push_str("\n\n");
+        }
+        out
+    }
+
+    /// Per-frame draw cost of an N-block markdown doc drawn in a fixed clipped
+    /// viewport, plus how many top-level blocks were actually laid out in the
+    /// final frame (the deterministic measure of viewport culling).
+    fn measure_markdown_draw(
+        blocks: usize,
+        cx: &mut TestAppContext,
+    ) -> (std::time::Duration, usize) {
+        struct TestWindow;
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let source = perf_doc(blocks);
+        let (_, mut cx) = cx.add_window_view(|_, _| TestWindow);
+        let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+        cx.run_until_parked();
+
+        let viewport = size(px(800.), px(600.));
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.draw(Default::default(), viewport, |_, _| {
+                // Hidden code-block buttons: `CopyButton` calls `current_view()`,
+                // which panics when drawing detached from a view (as the test
+                // harness does); this matches the other render helpers here.
+                let element = MarkdownElement::new(markdown.clone(), MarkdownStyle::default())
+                    .code_block_renderer(CodeBlockRenderer::Default {
+                        copy_button_visibility: CopyButtonVisibility::Hidden,
+                        wrap_button_visibility: WrapButtonVisibility::Hidden,
+                        border: false,
+                    });
+                // Clip to the viewport so a virtualized impl has a real
+                // `content_mask` to cull against (the agent thread's scroll
+                // viewport plays this role in the app).
+                div().w(px(800.)).h(px(600.)).overflow_hidden().child(element)
+            });
+        };
+
+        draw(&mut cx); // warm up parse + first layout
+        let iterations = 12;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            draw(&mut cx);
+        }
+        let per_frame = start.elapsed() / iterations;
+
+        BLOCKS_LAID_OUT.store(0, std::sync::atomic::Ordering::Relaxed);
+        draw(&mut cx);
+        let laid_out = BLOCKS_LAID_OUT.load(std::sync::atomic::Ordering::Relaxed);
+        (per_frame, laid_out)
+    }
+
+    /// Red test for #57349: per-frame markdown draw cost must be bounded by the
+    /// visible viewport, not the total document size. Fails today (cost is
+    /// O(total blocks)); should pass once block-level viewport culling lands.
+    #[gpui::test]
+    fn perf_markdown_layout_scales_with_visible(cx: &mut TestAppContext) {
+        let (small_time, small_n) = measure_markdown_draw(150, cx);
+        let (large_time, large_n) = measure_markdown_draw(1500, cx);
+        println!(
+            "markdown draw/frame: 150 blocks = {small_time:?} ({small_n} laid out), \
+             1500 blocks = {large_time:?} ({large_n} laid out)"
+        );
+        // The deterministic invariant: layout is bounded by the viewport, so a
+        // 10x larger document lays out the same (bounded) number of blocks, not
+        // 10x more. Wall-time above is informational (build is still O(N)).
+        assert!(
+            large_n < 1500,
+            "no viewport culling happened: laid out all {large_n} blocks"
+        );
+        assert!(
+            large_n <= small_n.max(64),
+            "layout not viewport-bounded: {large_n} blocks laid out for the 1500-block doc \
+             vs {small_n} for the 150-block doc"
+        );
+    }
+
+    /// Regression for #57349: hovering/selecting over a long message used to
+    /// panic in `TextLayout::bounds()` because off-screen (culled) lines have no
+    /// geometry. The `RenderedText` queries must now skip un-laid-out lines.
+    #[gpui::test]
+    fn culled_blocks_survive_geometry_queries(cx: &mut TestAppContext) {
+        struct TestWindow;
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let source = perf_doc(2000); // far taller than the viewport → most blocks culled
+        let source_len = source.len();
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        cx.simulate_resize(size(px(800.), px(600.)));
+        let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+        cx.run_until_parked();
+
+        BLOCKS_LAID_OUT.store(0, std::sync::atomic::Ordering::Relaxed);
+        let (rendered, _) = cx.draw(Default::default(), size(px(800.), px(600.)), |_, _| {
+            MarkdownElement::new(markdown.clone(), MarkdownStyle::default()).code_block_renderer(
+                CodeBlockRenderer::Default {
+                    copy_button_visibility: CopyButtonVisibility::Hidden,
+                    wrap_button_visibility: WrapButtonVisibility::Hidden,
+                    border: false,
+                },
+            )
+        });
+        // Guard against a vacuous test: culling must actually have happened.
+        assert!(
+            BLOCKS_LAID_OUT.load(std::sync::atomic::Ordering::Relaxed) < 2000,
+            "culling didn't engage, so this test wouldn't exercise the crash"
+        );
+
+        let text = rendered.text;
+        // Each of these walks the line list (including off-screen lines) and
+        // previously panicked on the first culled line's missing bounds.
+        for y in [5.0, 300.0, 2000.0, 40000.0, 80000.0] {
+            let _ = text.source_index_for_position(point(px(400.), px(y)));
+        }
+        let _ = text.bounds_for_source_range(0..source_len);
+        let _ = text.position_for_source_index(source_len.saturating_sub(10));
+    }
+
+    /// Documents the *actual* viewport-culling tradeoff for #57349: whatever is
+    /// scrolled into view gets laid out and stays hit-testable (so hover/select
+    /// follow the viewport), while content never scrolled to has no geometry yet.
+    #[gpui::test]
+    fn scrolling_into_a_message_keeps_visible_text_hit_testable(cx: &mut TestAppContext) {
+        struct TestWindow;
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let source = perf_doc(2000);
+        let source_len = source.len();
+        let (_, mut cx) = cx.add_window_view(|_, _| TestWindow);
+        cx.simulate_resize(size(px(800.), px(600.)));
+        let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+        cx.run_until_parked();
+
+        // Draw the message scrolled down by `scroll` px (negative origin), then
+        // hit-test the center of the 600px viewport and check whether a position
+        // near the very end of the message has geometry.
+        let mut sample = |scroll: f32| -> (usize, bool) {
+            let (rendered, _) =
+                cx.draw(point(px(0.), px(-scroll)), size(px(800.), px(600.)), |_, _| {
+                    MarkdownElement::new(markdown.clone(), MarkdownStyle::default())
+                        .code_block_renderer(CodeBlockRenderer::Default {
+                            copy_button_visibility: CopyButtonVisibility::Hidden,
+                            wrap_button_visibility: WrapButtonVisibility::Hidden,
+                            border: false,
+                        })
+                });
+            let hit = rendered
+                .text
+                .source_index_for_position(point(px(400.), px(300.)))
+                .unwrap_or_else(|fallback| fallback);
+            let end_has_geometry = rendered
+                .text
+                .position_for_source_index(source_len.saturating_sub(50))
+                .is_some();
+            (hit, end_has_geometry)
+        };
+
+        let (top, top_sees_end) = sample(0.0);
+        let (mid, _) = sample(20_000.0);
+        let (deep, _) = sample(60_000.0);
+        println!("hit source idx — top:{top} mid:{mid} deep:{deep}; top_sees_end:{top_sees_end}");
+
+        // What you scroll to is laid out and hit-testable, and resolves to
+        // progressively later content — i.e. interaction follows the viewport.
+        assert!(
+            top < mid && mid < deep,
+            "scrolling should reveal and locate later content: {top} < {mid} < {deep}"
+        );
+        // The tradeoff, made concrete: from the top, content near the end hasn't
+        // been laid out, so it has no geometry until you scroll to it.
+        assert!(
+            !top_sees_end,
+            "off-screen content should have no geometry until scrolled into view"
+        );
     }
 
     #[gpui::test]

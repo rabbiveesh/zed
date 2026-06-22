@@ -909,6 +909,13 @@ impl TextLayout {
         self.0.borrow().as_ref().unwrap().bounds.unwrap()
     }
 
+    /// The bounds of this layout, or `None` if it was measured but not yet
+    /// positioned this frame (e.g. content culled off-screen, so `prepaint`
+    /// never ran for it).
+    pub fn bounds_opt(&self) -> Option<Bounds<Pixels>> {
+        self.0.borrow().as_ref().and_then(|state| state.bounds)
+    }
+
     /// The line height for this layout.
     pub fn line_height(&self) -> Pixels {
         self.0.borrow().as_ref().unwrap().line_height
