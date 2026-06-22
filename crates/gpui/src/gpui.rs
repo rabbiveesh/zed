@@ -33,6 +33,8 @@ mod keymap;
 mod path_builder;
 mod platform;
 pub mod prelude;
+/// Env-gated ad-hoc CPU / redraw rate probe (see `cpu_probe::record`).
+pub mod cpu_probe;
 /// Profiling utilities for task, frame, and thread performance tracking.
 pub mod profiler;
 #[cfg(any(

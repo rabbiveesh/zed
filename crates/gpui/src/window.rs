@@ -2189,6 +2189,7 @@ impl Window {
     ///
     /// If called from within a view, it will notify that view on the next frame. Otherwise, it will refresh the entire window.
     pub fn request_animation_frame(&self) {
+        crate::cpu_probe::count("frame.animation_request");
         let entity = self.current_view();
         self.on_next_frame(move |_, cx| cx.notify(entity));
     }
@@ -2624,6 +2625,7 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        let _draw_probe = crate::cpu_probe::time("frame.draw");
         // Drain unconditionally so a stale first-invalidation timestamp can't
         // leak into a later frame across enable/disable of frame tracing.
         let frame_dirty = self.invalidator.take_frame_dirty();
