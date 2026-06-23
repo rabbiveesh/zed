@@ -36,6 +36,11 @@ fn markdown_render(target_size: &usize, cx: &mut BenchAppContext) {
         window.replace_root(cx, |_window, _cx| MarkdownBenchView { markdown })
     });
 
+    // Markdown parses asynchronously; await it so we measure steady-state
+    // re-rendering of a parsed document rather than racing the parse (which,
+    // for large inputs, otherwise measures an empty document).
+    window.run_until_idle();
+
     cx.bench_renderer(view, |_, _, cx| cx.notify());
 }
 
