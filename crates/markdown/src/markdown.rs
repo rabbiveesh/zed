@@ -629,6 +629,10 @@ impl Markdown {
         })
     }
 
+    // TODO(#57349): the lazy renderer no longer builds every code block each
+    // frame, so it can't garbage-collect scroll handles by visible id. Re-wire
+    // retention off the parsed code-block offsets on reparse.
+    #[allow(dead_code)]
     fn retain_code_block_scroll_handles(&mut self, ids: &HashSet<usize>) {
         self.code_block_scroll_handles
             .retain(|id, _| ids.contains(id));
@@ -655,6 +659,7 @@ impl Markdown {
         }
     }
 
+    #[allow(dead_code)] // see retain_code_block_scroll_handles
     fn clear_code_block_scroll_handles(&mut self) {
         self.code_block_scroll_handles.clear();
     }
@@ -2846,6 +2851,8 @@ impl Element for MarkdownElement {
             lines: lines.into(),
             links: links.into(),
             footnote_refs: footnote_refs.into(),
+            source: layout.parsed_markdown.source.clone(),
+            events: layout.parsed_markdown.events.clone(),
         };
         self.autoscroll(&text, window, cx);
         MarkdownPrepaint {
@@ -3573,6 +3580,10 @@ impl MarkdownElementBuilder {
                 lines: self.rendered_lines.into(),
                 links: self.rendered_links.into(),
                 footnote_refs: self.rendered_footnote_refs.into(),
+                // Filled in by MarkdownElement::prepaint when assembling the
+                // document-wide RenderedText; per-block builds leave it empty.
+                source: SharedString::default(),
+                events: Arc::from([]),
             },
         }
     }
@@ -3773,6 +3784,10 @@ struct RenderedText {
     lines: Rc<[RenderedLine]>,
     links: Rc<[RenderedLink]>,
     footnote_refs: Rc<[RenderedFootnoteRef]>,
+    /// Full-document source + events, so copy/selection can recover the text of
+    /// blocks that are currently off-screen (and therefore absent from `lines`).
+    source: SharedString,
+    events: Arc<[(Range<usize>, MarkdownEvent)]>,
 }
 
 struct WrappedLineSegment {
@@ -4075,6 +4090,78 @@ impl RenderedText {
     }
 
     fn text_for_range(&self, range: Range<usize>) -> String {
+        // The visible lines hold exact rendered (stripped) text. If the range is
+        // fully on screen, use them; otherwise it reaches culled blocks, so
+        // recover their text from the source events instead (#57349).
+        if self.lines_cover(&range) {
+            self.text_from_lines(range)
+        } else {
+            self.text_from_source(range)
+        }
+    }
+
+    /// Whether the on-screen lines reach the end of `range` — i.e. the range
+    /// doesn't extend into culled blocks below. (Leading non-rendered syntax
+    /// before the first line is fine; the line path clamps to it.)
+    fn lines_cover(&self, range: &Range<usize>) -> bool {
+        match self.lines.last() {
+            Some(last) => range.end <= last.source_end,
+            None => range.start == range.end,
+        }
+    }
+
+    /// Recover the rendered text for `range` from the source events, so copying
+    /// a selection that spans off-screen (culled) blocks still yields their text.
+    fn text_from_source(&self, range: Range<usize>) -> String {
+        let mut out = String::new();
+        let mut block_break = false;
+        let in_range = |event_range: &Range<usize>| {
+            event_range.start >= range.start && event_range.start < range.end
+        };
+        for (event_range, event) in self.events.iter() {
+            if event_range.start >= range.end {
+                break;
+            }
+            match event {
+                MarkdownEvent::Text | MarkdownEvent::Code => {
+                    let start = event_range.start.max(range.start);
+                    let end = event_range.end.min(range.end);
+                    if start < end {
+                        if block_break {
+                            out.push('\n');
+                            block_break = false;
+                        }
+                        out.push_str(&self.source[start..end]);
+                    }
+                }
+                MarkdownEvent::SubstitutedText(text) => {
+                    if event_range.start < range.end && event_range.end > range.start {
+                        if block_break {
+                            out.push('\n');
+                            block_break = false;
+                        }
+                        out.push_str(text);
+                    }
+                }
+                MarkdownEvent::SoftBreak if in_range(event_range) => out.push(' '),
+                MarkdownEvent::HardBreak if in_range(event_range) => out.push('\n'),
+                MarkdownEvent::FootnoteReference(label) if in_range(event_range) => {
+                    if block_break {
+                        out.push('\n');
+                        block_break = false;
+                    }
+                    out.push_str(&format!("[{label}]"));
+                }
+                MarkdownEvent::RootEnd(_) if !out.is_empty() && event_range.end > range.start => {
+                    block_break = true;
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn text_from_lines(&self, range: Range<usize>) -> String {
         let mut accumulator = String::new();
 
         for line in self.lines.iter() {
@@ -4302,7 +4389,7 @@ mod tests {
         ensure_theme_initialized(cx);
         let source = perf_doc(2000);
         let source_len = source.len();
-        let (_, mut cx) = cx.add_window_view(|_, _| TestWindow);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
         cx.simulate_resize(size(px(800.), px(600.)));
         let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
         cx.run_until_parked();
@@ -4370,11 +4457,7 @@ mod tests {
 
     /// Copying a range that spans the whole (tall) message must include blocks
     /// far off-screen. After lazy build this is what forces a source-text model.
-    // PENDING: red until the lazy renderer's source-text model lands — with
-    // viewport culling, off-screen lines aren't measured, so copy must read
-    // their text from the source, not the (unmeasured) layout. Un-ignore then.
     #[gpui::test]
-    #[ignore = "needs source-text model for off-screen copy (#57349 lazy renderer)"]
     fn guard_copy_spans_offscreen_blocks(cx: &mut TestAppContext) {
         let src = format!("para one\n\npara two\n\n{}", "filler block\n\n".repeat(500));
         let text = render_markdown(&src, cx);
