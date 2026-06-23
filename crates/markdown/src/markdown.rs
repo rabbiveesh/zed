@@ -1160,6 +1160,28 @@ impl ParsedMarkdown {
         &self.root_block_starts
     }
 
+    /// The event-index range of each top-level (root) block, in document order.
+    /// The parser emits `RootStart`/`RootEnd` only at depth 0, so each range is a
+    /// complete, balanced event subtree — building it on its own with a fresh
+    /// builder renders exactly that block, which is the basis for only building
+    /// the blocks that are on screen (#57349).
+    pub(crate) fn root_block_event_ranges(&self) -> Vec<Range<usize>> {
+        let mut ranges = Vec::with_capacity(self.root_block_starts.len());
+        let mut start = None;
+        for (index, (_, event)) in self.events.iter().enumerate() {
+            match event {
+                MarkdownEvent::RootStart => start = Some(index),
+                MarkdownEvent::RootEnd(_) => {
+                    if let Some(start) = start.take() {
+                        ranges.push(start..index + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        ranges
+    }
+
     pub fn root_block_for_source_index(&self, source_index: usize) -> Option<usize> {
         if self.root_block_starts.is_empty() {
             return None;
@@ -2690,19 +2712,38 @@ impl Element for MarkdownElement {
         };
         let mut code_block_ids = HashSet::default();
 
-        self.build_events(
-            &mut builder,
-            &parsed_markdown,
-            0..parsed_markdown.events.len(),
-            &images,
-            active_root_block,
-            markdown_end,
-            render_mermaid_diagrams,
-            &mermaid_state,
-            &mut code_block_ids,
-            window,
-            cx,
-        );
+        // Build the document one top-level block at a time. Any events between
+        // root blocks (rare — e.g. stray top-level text) are built too, so
+        // nothing is dropped; building per-segment into the same builder is
+        // identical to building the whole range at once. The per-block split is
+        // what the viewport-culling renderer will use to skip off-screen blocks.
+        let mut segments = Vec::new();
+        let mut cursor = 0;
+        for block in parsed_markdown.root_block_event_ranges() {
+            if cursor < block.start {
+                segments.push(cursor..block.start);
+            }
+            cursor = block.end;
+            segments.push(block);
+        }
+        if cursor < parsed_markdown.events.len() {
+            segments.push(cursor..parsed_markdown.events.len());
+        }
+        for segment in segments {
+            self.build_events(
+                &mut builder,
+                &parsed_markdown,
+                segment,
+                &images,
+                active_root_block,
+                markdown_end,
+                render_mermaid_diagrams,
+                &mermaid_state,
+                &mut code_block_ids,
+                window,
+                cx,
+            );
+        }
         if self.style.code_block_overflow_x_scroll {
             let code_block_ids = code_block_ids;
             self.markdown.update(cx, move |markdown, _| {
@@ -4354,6 +4395,49 @@ mod tests {
             .filter_map(|i| text.link_for_source_index(i))
             .any(|link| link.destination_url.as_ref() == "https://example.com");
         assert!(found, "link not detectable by source index");
+    }
+
+    /// The per-root-block split (the basis for viewport culling) must cover the
+    /// whole document: one well-formed range per root block, ordered and
+    /// non-overlapping.
+    #[gpui::test]
+    fn root_block_event_ranges_cover_the_document(cx: &mut TestAppContext) {
+        struct TestWindow;
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        ensure_theme_initialized(cx);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        let src = "# Heading\n\nA paragraph.\n\n- a\n- b\n\n```rust\nfn f() {}\n```\n\n> quote\n\n---";
+        let markdown = cx.new(|cx| Markdown::new(src.into(), None, None, cx));
+        cx.run_until_parked();
+
+        markdown.read_with(cx, |md, _| {
+            let parsed = &md.parsed_markdown;
+            let ranges = parsed.root_block_event_ranges();
+            assert_eq!(
+                ranges.len(),
+                parsed.root_block_starts.len(),
+                "one range per root block"
+            );
+            assert!(
+                ranges.len() >= 5,
+                "expected several blocks, got {}",
+                ranges.len()
+            );
+            for range in &ranges {
+                assert!(matches!(parsed.events[range.start].1, MarkdownEvent::RootStart));
+                assert!(matches!(
+                    parsed.events[range.end - 1].1,
+                    MarkdownEvent::RootEnd(_)
+                ));
+            }
+            for pair in ranges.windows(2) {
+                assert!(pair[0].end <= pair[1].start, "ranges overlap or are unordered");
+            }
+        });
     }
 
     #[gpui::test]
