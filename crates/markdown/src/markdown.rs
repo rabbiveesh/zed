@@ -629,10 +629,8 @@ impl Markdown {
         })
     }
 
-    // TODO(#57349): the lazy renderer no longer builds every code block each
-    // frame, so it can't garbage-collect scroll handles by visible id. Re-wire
-    // retention off the parsed code-block offsets on reparse.
-    #[allow(dead_code)]
+    /// Drop scroll handles for code blocks that no longer exist after a reparse,
+    /// keyed by each code block's source offset.
     fn retain_code_block_scroll_handles(&mut self, ids: &HashSet<usize>) {
         self.code_block_scroll_handles
             .retain(|id, _| ids.contains(id));
@@ -659,10 +657,6 @@ impl Markdown {
         }
     }
 
-    #[allow(dead_code)] // see retain_code_block_scroll_handles
-    fn clear_code_block_scroll_handles(&mut self) {
-        self.code_block_scroll_handles.clear();
-    }
 
     fn autoscroll_code_block(&self, source_index: usize, cursor_position: Point<Pixels>) {
         let Some((_, scroll_handle)) = self
@@ -1037,6 +1031,16 @@ impl Markdown {
             this.update(cx, |this, cx| {
                 this.parsed_markdown = parsed;
                 this.block_heights.clear();
+                let code_block_ids = this
+                    .parsed_markdown
+                    .events
+                    .iter()
+                    .filter_map(|(range, event)| {
+                        matches!(event, MarkdownEvent::Start(MarkdownTag::CodeBlock { .. }))
+                            .then_some(range.start)
+                    })
+                    .collect();
+                this.retain_code_block_scroll_handles(&code_block_ids);
                 this.images_by_source_offset = images_by_source_offset;
                 if this.active_root_block.is_some_and(|block_index| {
                     block_index >= this.parsed_markdown.root_block_starts.len()
@@ -2755,7 +2759,6 @@ impl Element for MarkdownElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        let _layout_probe = gpui::cpu_probe::time("markdown.request_layout");
         let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
             let markdown = self.markdown.read(cx);
             (
@@ -3897,12 +3900,6 @@ impl RenderedText {
                 continue;
             }
 
-            // Off-screen (culled) lines have no geometry this frame, and
-            // `wrapped_line_segments` calls `bounds()`, which would panic on
-            // them; their selection/search rects simply aren't drawn (#57349).
-            if line.layout.bounds_opt().is_none() {
-                continue;
-            }
             let wrapped_line_segments = Self::wrapped_line_segments(line);
             if wrapped_line_segments.is_empty() {
                 continue;
@@ -4032,11 +4029,7 @@ impl RenderedText {
         let mut fallback_line: Option<&RenderedLine> = None;
 
         while let Some(line) = lines.next() {
-            // Skip lines that weren't laid out this frame (off-screen / culled),
-            // so they have no geometry to query (issue #57349 virtualization).
-            let Some(line_bounds) = line.layout.bounds_opt() else {
-                continue;
-            };
+            let line_bounds = line.layout.bounds();
 
             // Exact match: position is within bounds (handles overlapping bounds like table columns)
             if line_bounds.contains(&position) {
@@ -4051,8 +4044,7 @@ impl RenderedText {
             // Handle gap between lines
             if position.y > line_bounds.bottom() {
                 if let Some(next_line) = lines.peek()
-                    && let Some(next_bounds) = next_line.layout.bounds_opt()
-                    && position.y < next_bounds.top()
+                    && position.y < next_line.layout.bounds().top()
                 {
                     return Err(line.source_end);
                 }
@@ -4075,8 +4067,6 @@ impl RenderedText {
             } else if source_index > line.source_end {
                 continue;
             } else {
-                // The target line is off-screen (culled) and has no geometry.
-                line.layout.bounds_opt()?;
                 let line_height = line.layout.line_height();
                 let rendered_index_within_line = line.rendered_index_for_source_index(source_index);
                 let position = line.layout.position_for_index(rendered_index_within_line)?;
