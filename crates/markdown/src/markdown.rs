@@ -1954,61 +1954,33 @@ impl MarkdownElement {
             }
         });
     }
-}
 
-impl Styled for MarkdownElement {
-    fn style(&mut self) -> &mut StyleRefinement {
-        &mut self.style.container_style
-    }
-}
-
-impl Element for MarkdownElement {
-    type RequestLayoutState = RenderedMarkdown;
-    type PrepaintState = Hitbox;
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
+    /// Build the markdown element subtree for the events in `events` (an index
+    /// range into `parsed_markdown.events`). Because the parser emits
+    /// `RootStart`/`RootEnd` only at depth 0, every top-level block is a
+    /// balanced subtree, so calling this per root-block produces the same result
+    /// as calling it over the whole document — which is what lets the renderer
+    /// build only the visible blocks (#57349).
+    fn build_events(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        parsed_markdown: &ParsedMarkdown,
+        events: Range<usize>,
+        images: &HashMap<usize, Arc<Image>>,
+        active_root_block: Option<usize>,
+        markdown_end: usize,
+        render_mermaid_diagrams: bool,
+        mermaid_state: &MermaidState,
+        code_block_ids: &mut HashSet<usize>,
         window: &mut Window,
         cx: &mut App,
-    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        let _layout_probe = gpui::cpu_probe::time("markdown.request_layout");
-        let mut builder = MarkdownElementBuilder::new(
-            &self.style.container_style,
-            self.style.base_text_style.clone(),
-            self.style.syntax.clone(),
-        );
-        let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
-            let markdown = self.markdown.read(cx);
-            (
-                markdown.parsed_markdown.clone(),
-                markdown.images_by_source_offset.clone(),
-                markdown.active_root_block,
-                markdown.options.render_mermaid_diagrams,
-                markdown.mermaid_state.clone(),
-            )
-        };
-        let markdown_end = if let Some(last) = parsed_markdown.events.last() {
-            last.0.end
-        } else {
-            0
-        };
-        let mut code_block_ids = HashSet::default();
-
+    ) {
         let mut current_img_block_range: Option<Range<usize>> = None;
         let mut handled_html_block = false;
         let mut rendered_mermaid_block = false;
         let mut rendered_metadata_block = false;
-        for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
+        for index in events {
+            let (range, event) = &parsed_markdown.events[index];
             // Skip alt text for images that rendered
             if let Some(current_img_block_range) = &current_img_block_range
                 && current_img_block_range.end > range.end
@@ -2063,7 +2035,7 @@ impl Element for MarkdownElement {
                             if let Some(image) = images.get(&range.start) {
                                 current_img_block_range = Some(range.clone());
                                 self.push_markdown_image(
-                                    &mut builder,
+                                    &mut *builder,
                                     range,
                                     image.clone().into(),
                                     dest_url.clone(),
@@ -2078,7 +2050,7 @@ impl Element for MarkdownElement {
                             {
                                 current_img_block_range = Some(range.clone());
                                 self.push_markdown_image(
-                                    &mut builder,
+                                    &mut *builder,
                                     range,
                                     source,
                                     dest_url.clone(),
@@ -2094,7 +2066,7 @@ impl Element for MarkdownElement {
                                 .current_cell_alignment()
                                 .and_then(alignment_to_text_align);
                             self.push_markdown_paragraph(
-                                &mut builder,
+                                &mut *builder,
                                 range,
                                 markdown_end,
                                 text_align_override,
@@ -2106,7 +2078,7 @@ impl Element for MarkdownElement {
                                 .current_cell_alignment()
                                 .and_then(alignment_to_text_align);
                             self.push_markdown_heading(
-                                &mut builder,
+                                &mut *builder,
                                 *level,
                                 range,
                                 markdown_end,
@@ -2115,7 +2087,7 @@ impl Element for MarkdownElement {
                         }
                         MarkdownTag::BlockQuote(kind) => {
                             self.push_markdown_block_quote(
-                                &mut builder,
+                                &mut *builder,
                                 *kind,
                                 range,
                                 markdown_end,
@@ -2139,7 +2111,7 @@ impl Element for MarkdownElement {
                                     mermaid_diagram.content_range.clone(),
                                     render_mermaid_diagram(
                                         mermaid_diagram,
-                                        &mermaid_state,
+                                        mermaid_state,
                                         &self.style,
                                         self.markdown.clone(),
                                         range.start,
@@ -2239,7 +2211,7 @@ impl Element for MarkdownElement {
                         MarkdownTag::HtmlBlock => {
                             builder.push_div(div(), range, markdown_end);
                             if let Some(block) = parsed_markdown.html_blocks.get(&range.start) {
-                                self.render_html_block(block, &mut builder, markdown_end, cx);
+                                self.render_html_block(block, &mut *builder, markdown_end, cx);
                                 handled_html_block = true;
                             }
                         }
@@ -2286,7 +2258,7 @@ impl Element for MarkdownElement {
                                 } else {
                                     div().child("•").into_any_element()
                                 };
-                            self.push_markdown_list_item(&mut builder, bullet, range, markdown_end);
+                            self.push_markdown_list_item(&mut *builder, bullet, range, markdown_end);
                         }
                         MarkdownTag::Emphasis => builder.push_text_style(TextStyleRefinement {
                             font_style: Some(FontStyle::Italic),
@@ -2354,7 +2326,7 @@ impl Element for MarkdownElement {
                                 parsed_markdown.metadata_blocks.get(&range.start)
                             {
                                 self.push_metadata_block(
-                                    &mut builder,
+                                    &mut *builder,
                                     &parsed_markdown.source,
                                     metadata_block,
                                     markdown_end,
@@ -2454,13 +2426,13 @@ impl Element for MarkdownElement {
                         current_img_block_range.take();
                     }
                     MarkdownTagEnd::Paragraph => {
-                        self.pop_markdown_paragraph(&mut builder);
+                        self.pop_markdown_paragraph(&mut *builder);
                     }
                     MarkdownTagEnd::Heading(_) => {
-                        self.pop_markdown_heading(&mut builder);
+                        self.pop_markdown_heading(&mut *builder);
                     }
                     MarkdownTagEnd::BlockQuote(_kind) => {
-                        self.pop_markdown_block_quote(&mut builder);
+                        self.pop_markdown_block_quote(&mut *builder);
                     }
                     MarkdownTagEnd::CodeBlock => {
                         builder.trim_trailing_newline();
@@ -2548,7 +2520,7 @@ impl Element for MarkdownElement {
                         builder.pop_div();
                     }
                     MarkdownTagEnd::Item => {
-                        self.pop_markdown_list_item(&mut builder);
+                        self.pop_markdown_list_item(&mut *builder);
                     }
                     MarkdownTagEnd::Emphasis => builder.pop_text_style(),
                     MarkdownTagEnd::Strong => builder.pop_text_style(),
@@ -2592,7 +2564,7 @@ impl Element for MarkdownElement {
                 }
                 MarkdownEvent::Code => {
                     self.push_markdown_code_span(
-                        &mut builder,
+                        &mut *builder,
                         &parsed_markdown.source[range.clone()],
                         range.clone(),
                         cx,
@@ -2620,7 +2592,7 @@ impl Element for MarkdownElement {
                     {
                         let code_start = range.start + "<code>".len();
                         self.push_markdown_code_span(
-                            &mut builder,
+                            &mut *builder,
                             code,
                             code_start..code_start + code.len(),
                             cx,
@@ -2667,6 +2639,70 @@ impl Element for MarkdownElement {
                 }
             }
         }
+    }
+}
+
+impl Styled for MarkdownElement {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style.container_style
+    }
+}
+
+impl Element for MarkdownElement {
+    type RequestLayoutState = RenderedMarkdown;
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let _layout_probe = gpui::cpu_probe::time("markdown.request_layout");
+        let mut builder = MarkdownElementBuilder::new(
+            &self.style.container_style,
+            self.style.base_text_style.clone(),
+            self.style.syntax.clone(),
+        );
+        let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
+            let markdown = self.markdown.read(cx);
+            (
+                markdown.parsed_markdown.clone(),
+                markdown.images_by_source_offset.clone(),
+                markdown.active_root_block,
+                markdown.options.render_mermaid_diagrams,
+                markdown.mermaid_state.clone(),
+            )
+        };
+        let markdown_end = if let Some(last) = parsed_markdown.events.last() {
+            last.0.end
+        } else {
+            0
+        };
+        let mut code_block_ids = HashSet::default();
+
+        self.build_events(
+            &mut builder,
+            &parsed_markdown,
+            0..parsed_markdown.events.len(),
+            &images,
+            active_root_block,
+            markdown_end,
+            render_mermaid_diagrams,
+            &mermaid_state,
+            &mut code_block_ids,
+            window,
+            cx,
+        );
         if self.style.code_block_overflow_x_scroll {
             let code_block_ids = code_block_ids;
             self.markdown.update(cx, move |markdown, _| {
