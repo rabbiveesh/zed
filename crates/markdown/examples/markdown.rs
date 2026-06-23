@@ -33,6 +33,33 @@ Remember, markdown processors may have slight differences and extensions, so alw
 
 "#;
 
+/// Build a document of `blocks` blank-line-separated top-level blocks for
+/// stress-testing the renderer (set `MD_BLOCKS=N`). Run with
+/// `ZED_CPU_PROBE=1 RUST_LOG=cpu_probe=info,markdown=info` to watch frame cost.
+fn stress_doc(blocks: usize) -> String {
+    let mut out = String::new();
+    for i in 0..blocks {
+        match i % 5 {
+            0 => out.push_str(&format!("## Heading {i}\n\n")),
+            1 => out.push_str(&format!(
+                "Paragraph {i} with some **bold**, _italic_, `inline code`, and a \
+                 [link](https://example.com) plus filler words to wrap a couple of times.\n\n"
+            )),
+            2 => out.push_str(&format!("- bullet {i} a\n- bullet {i} b\n- bullet {i} c\n\n")),
+            3 => out.push_str(&format!("```rust\nfn block_{i}() -> usize {{ {i} * 2 + 1 }}\n```\n\n")),
+            _ => out.push_str(&format!("> quote {i} that wraps a little when narrow enough\n\n")),
+        }
+    }
+    out
+}
+
+fn example_doc() -> SharedString {
+    match std::env::var("MD_BLOCKS").ok().and_then(|v| v.parse().ok()) {
+        Some(blocks) => stress_doc(blocks).into(),
+        None => MARKDOWN_EXAMPLE.into(),
+    }
+}
+
 pub fn main() {
     env_logger::init();
     gpui_platform::application().with_assets(Assets).run(|cx| {
@@ -52,7 +79,7 @@ pub fn main() {
 
         cx.activate(true);
         cx.open_window(WindowOptions::default(), |_, cx| {
-            cx.new(|cx| MarkdownExample::new(MARKDOWN_EXAMPLE.into(), language_registry, cx))
+            cx.new(|cx| MarkdownExample::new(example_doc(), language_registry, cx))
         })
         .unwrap();
     });
