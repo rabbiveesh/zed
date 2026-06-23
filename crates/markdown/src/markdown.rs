@@ -1925,16 +1925,71 @@ impl MarkdownElement {
         });
     }
 
+    /// Estimate the position of a source index in a culled (not-yet-built)
+    /// block from the cached per-block heights — mirroring exactly how prepaint
+    /// stacks blocks — so search/anchor scrolls can reveal off-screen targets
+    /// (#57349). Returns the block's top; the block measures precisely once it
+    /// scrolls into view.
+    fn estimated_position_for_source_index(
+        &self,
+        layout: &MarkdownLayout,
+        bounds: Bounds<Pixels>,
+        source_index: usize,
+        window: &Window,
+        cx: &App,
+    ) -> Option<(Point<Pixels>, Pixels)> {
+        let block_heights = &self.markdown.read(cx).block_heights;
+        let line_height = self
+            .style
+            .base_text_style
+            .line_height_in_pixels(window.rem_size());
+        let mut y = bounds.top();
+        for (index, segment) in layout.segments.iter().enumerate() {
+            let source_start = layout.parsed_markdown.events.get(segment.start)?.0.start;
+            let source_end = layout
+                .parsed_markdown
+                .events
+                .get(segment.end.saturating_sub(1))?
+                .0
+                .end;
+            let height = block_heights
+                .get(index)
+                .copied()
+                .flatten()
+                .unwrap_or(ESTIMATED_BLOCK_HEIGHT);
+            if (source_start..source_end).contains(&source_index) {
+                return Some((point(bounds.left(), y), line_height));
+            }
+            y += height;
+        }
+        None
+    }
+
     fn autoscroll(
         &self,
+        layout: &MarkdownLayout,
         rendered_text: &RenderedText,
+        bounds: Bounds<Pixels>,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<()> {
         let autoscroll_index = self
             .markdown
             .update(cx, |markdown, _| markdown.autoscroll_request.take())?;
-        let (position, line_height) = rendered_text.position_for_source_index(autoscroll_index)?;
+        // Use the exact position when the target is on screen; otherwise the
+        // target block was culled, so estimate its position from the cached
+        // per-block heights — enough to scroll it into view (#57349).
+        let (position, line_height) = rendered_text
+            .position_for_source_index(autoscroll_index)
+            .or_else(|| {
+                self.estimated_position_for_source_index(
+                    layout,
+                    bounds,
+                    autoscroll_index,
+                    window,
+                    cx,
+                )
+            })?;
 
         match &self.autoscroll {
             AutoscrollBehavior::Controlled(scroll_handle) => {
@@ -2854,7 +2909,7 @@ impl Element for MarkdownElement {
             source: layout.parsed_markdown.source.clone(),
             events: layout.parsed_markdown.events.clone(),
         };
-        self.autoscroll(&text, window, cx);
+        self.autoscroll(layout, &text, bounds, window, cx);
         MarkdownPrepaint {
             blocks,
             text,
@@ -2932,9 +2987,9 @@ const ESTIMATED_BLOCK_HEIGHT: Pixels = px(40.);
 /// scrolls don't reveal unpainted gaps.
 const BLOCK_OVERSCAN: Pixels = px(800.);
 
-/// Counts how many top-level blocks were actually built (i.e. on-screen) in the
-/// current draw, so tests can assert per-frame build cost is bounded by the
-/// viewport rather than the document length (#57349).
+// Counts how many top-level blocks were actually built (i.e. on-screen) in the
+// current draw, so tests can assert per-frame build cost is bounded by the
+// viewport rather than the document length (#57349).
 #[cfg(test)]
 thread_local! {
     pub(crate) static BLOCKS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -4576,6 +4631,59 @@ mod tests {
         assert!(
             max_built < 100,
             "build not viewport-bounded while scrolling: peaked at {max_built} blocks/frame"
+        );
+    }
+
+    /// A search match in a culled (off-screen) block must scroll into view.
+    /// The target line isn't built, so autoscroll estimates its position from
+    /// the cached block heights and moves the scroll handle to reveal it
+    /// (#57349).
+    #[gpui::test]
+    fn autoscroll_reveals_offscreen_match(cx: &mut TestAppContext) {
+        struct TestView {
+            markdown: Entity<Markdown>,
+            scroll: ScrollHandle,
+        }
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .id("scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(
+                        MarkdownElement::new(self.markdown.clone(), MarkdownStyle::default())
+                            .scroll_handle(self.scroll.clone()),
+                    )
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let source = perf_doc(500);
+        let source_len = source.len();
+        let scroll = ScrollHandle::new();
+        let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+        let (_view, cx) = cx.add_window_view({
+            let markdown = markdown.clone();
+            let scroll = scroll.clone();
+            |_, _| TestView { markdown, scroll }
+        });
+        cx.simulate_resize(size(px(800.), px(600.)));
+        cx.run_until_parked();
+        let before = scroll.offset().y;
+
+        // Request a scroll to a match near the end (well off-screen), then redraw.
+        cx.update(|_, cx| {
+            markdown.update(cx, |markdown, cx| {
+                markdown.request_autoscroll_to_source_index(source_len.saturating_sub(50), cx)
+            })
+        });
+        cx.run_until_parked();
+        let after = scroll.offset().y;
+
+        assert!(
+            after < before - px(1000.),
+            "autoscroll did not reveal the off-screen match: {before:?} -> {after:?}"
         );
     }
 
