@@ -2831,7 +2831,7 @@ impl Element for MarkdownElement {
                 blocks.push(rendered.element);
                 y = block_top + measured_size.height;
                 #[cfg(test)]
-                BLOCKS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                BLOCKS_BUILT.with(|count| count.set(count.get() + 1));
             } else {
                 y = block_top + height;
             }
@@ -2936,8 +2936,9 @@ const BLOCK_OVERSCAN: Pixels = px(800.);
 /// current draw, so tests can assert per-frame build cost is bounded by the
 /// viewport rather than the document length (#57349).
 #[cfg(test)]
-pub(crate) static BLOCKS_BUILT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    pub(crate) static BLOCKS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 
 fn collect_image_alt_text(
@@ -4297,9 +4298,9 @@ mod tests {
         }
         let per_frame = start.elapsed() / iterations;
 
-        BLOCKS_BUILT.store(0, std::sync::atomic::Ordering::Relaxed);
+        BLOCKS_BUILT.with(|count| count.set(0));
         draw(&mut cx);
-        let laid_out = BLOCKS_BUILT.load(std::sync::atomic::Ordering::Relaxed);
+        let laid_out = BLOCKS_BUILT.with(|count| count.get());
         (per_frame, laid_out)
     }
 
@@ -4348,7 +4349,7 @@ mod tests {
         let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
         cx.run_until_parked();
 
-        BLOCKS_BUILT.store(0, std::sync::atomic::Ordering::Relaxed);
+        BLOCKS_BUILT.with(|count| count.set(0));
         let (_, rendered) = cx.draw(Default::default(), size(px(800.), px(600.)), |_, _| {
             MarkdownElement::new(markdown.clone(), MarkdownStyle::default()).code_block_renderer(
                 CodeBlockRenderer::Default {
@@ -4360,7 +4361,7 @@ mod tests {
         });
         // Guard against a vacuous test: culling must actually have happened.
         assert!(
-            BLOCKS_BUILT.load(std::sync::atomic::Ordering::Relaxed) < 2000,
+            BLOCKS_BUILT.with(|count| count.get()) < 2000,
             "culling didn't engage, so this test wouldn't exercise the crash"
         );
 
@@ -4525,6 +4526,57 @@ mod tests {
                 assert!(pair[0].end <= pair[1].start, "ranges overlap or are unordered");
             }
         });
+    }
+
+    /// O(visible) must hold at *every* scroll position, not just the top:
+    /// sweeping a tall document top-to-bottom never builds more than a
+    /// viewport's worth of blocks in any single frame (#57349).
+    #[gpui::test]
+    fn build_stays_viewport_bounded_while_scrolling(cx: &mut TestAppContext) {
+        struct TestWindow;
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        ensure_theme_initialized(cx);
+        let source = perf_doc(2000);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        cx.simulate_resize(size(px(800.), px(600.)));
+        let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+        cx.run_until_parked();
+
+        let viewport = size(px(800.), px(600.));
+        let steps = 40usize;
+        let step_px = 2000.0;
+        let mut max_built = 0;
+        let mut total = std::time::Duration::ZERO;
+        // Draw scrolled down by `scroll` px (negative origin) at each step.
+        for step in 0..steps {
+            let scroll = step as f32 * step_px;
+            BLOCKS_BUILT.with(|count| count.set(0));
+            let start = std::time::Instant::now();
+            cx.draw(point(px(0.), px(-scroll)), viewport, |_, _| {
+                MarkdownElement::new(markdown.clone(), MarkdownStyle::default()).code_block_renderer(
+                    CodeBlockRenderer::Default {
+                        copy_button_visibility: CopyButtonVisibility::Hidden,
+                        wrap_button_visibility: WrapButtonVisibility::Hidden,
+                        border: false,
+                    },
+                )
+            });
+            total += start.elapsed();
+            max_built = max_built.max(BLOCKS_BUILT.with(|count| count.get()));
+        }
+        println!(
+            "scroll sweep ({steps} positions over {:.0}px): max {max_built} blocks built/frame, avg {:?}/frame",
+            steps as f32 * step_px,
+            total / steps as u32
+        );
+        assert!(
+            max_built < 100,
+            "build not viewport-bounded while scrolling: peaked at {max_built} blocks/frame"
+        );
     }
 
     #[gpui::test]
