@@ -395,6 +395,10 @@ pub struct Markdown {
     context_menu_selected_text: Option<String>,
     search_highlights: Vec<Range<usize>>,
     active_search_highlight: Option<usize>,
+    /// Measured height of each top-level block (by segment index), cached across
+    /// frames so the renderer can size the document and position off-screen
+    /// blocks without laying them out. Reset on reparse (#57349).
+    block_heights: Vec<Option<Pixels>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -587,6 +591,7 @@ impl Markdown {
             context_menu_selected_text: None,
             search_highlights: Vec::new(),
             active_search_highlight: None,
+            block_heights: Vec::new(),
         };
         this.parse(cx);
         this
@@ -1026,6 +1031,7 @@ impl Markdown {
 
             this.update(cx, |this, cx| {
                 this.parsed_markdown = parsed;
+                this.block_heights.clear();
                 this.images_by_source_offset = images_by_source_offset;
                 if this.active_root_block.is_some_and(|block_index| {
                     block_index >= this.parsed_markdown.root_block_starts.len()
@@ -1244,7 +1250,7 @@ impl MarkdownElement {
     ) -> String {
         use gpui::size;
 
-        let (text, _) = cx.draw(
+        let (_, text) = cx.draw(
             Default::default(),
             size(px(600.0), px(600.0)),
             |window, cx| Self::new(markdown, style(window, cx)),
@@ -2671,8 +2677,8 @@ impl Styled for MarkdownElement {
 }
 
 impl Element for MarkdownElement {
-    type RequestLayoutState = RenderedMarkdown;
-    type PrepaintState = Hitbox;
+    type RequestLayoutState = MarkdownLayout;
+    type PrepaintState = MarkdownPrepaint;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -2690,11 +2696,6 @@ impl Element for MarkdownElement {
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
         let _layout_probe = gpui::cpu_probe::time("markdown.request_layout");
-        let mut builder = MarkdownElementBuilder::new(
-            &self.style.container_style,
-            self.style.base_text_style.clone(),
-            self.style.syntax.clone(),
-        );
         let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
             let markdown = self.markdown.read(cx);
             (
@@ -2705,18 +2706,11 @@ impl Element for MarkdownElement {
                 markdown.mermaid_state.clone(),
             )
         };
-        let markdown_end = if let Some(last) = parsed_markdown.events.last() {
-            last.0.end
-        } else {
-            0
-        };
-        let mut code_block_ids = HashSet::default();
+        let markdown_end = parsed_markdown.events.last().map_or(0, |last| last.0.end);
 
-        // Build the document one top-level block at a time. Any events between
-        // root blocks (rare — e.g. stray top-level text) are built too, so
-        // nothing is dropped; building per-segment into the same builder is
-        // identical to building the whole range at once. The per-block split is
-        // what the viewport-culling renderer will use to skip off-screen blocks.
+        // Split the document into per-top-level-block segments (plus any
+        // events between root blocks). Only the on-screen segments are built,
+        // in prepaint, where the scroll viewport is known.
         let mut segments = Vec::new();
         let mut cursor = 0;
         for block in parsed_markdown.root_block_event_ranges() {
@@ -2729,34 +2723,36 @@ impl Element for MarkdownElement {
         if cursor < parsed_markdown.events.len() {
             segments.push(cursor..parsed_markdown.events.len());
         }
-        for segment in segments {
-            self.build_events(
-                &mut builder,
-                &parsed_markdown,
-                segment,
-                &images,
+
+        // Size the element from cached block heights (estimating the unmeasured
+        // ones) so the scroll extent is right without laying anything out.
+        let total_height = self.markdown.update(cx, |markdown, _| {
+            if markdown.block_heights.len() != segments.len() {
+                markdown.block_heights = vec![None; segments.len()];
+            }
+            markdown
+                .block_heights
+                .iter()
+                .map(|height| height.unwrap_or(ESTIMATED_BLOCK_HEIGHT))
+                .sum::<Pixels>()
+        });
+
+        let mut style = gpui::Style::default();
+        style.size.width = Length::Definite(gpui::relative(1.));
+        style.size.height = Length::Definite(total_height.into());
+        let layout_id = window.request_layout(style, [], cx);
+        (
+            layout_id,
+            MarkdownLayout {
+                parsed_markdown,
+                segments,
+                images,
                 active_root_block,
                 markdown_end,
                 render_mermaid_diagrams,
-                &mermaid_state,
-                &mut code_block_ids,
-                window,
-                cx,
-            );
-        }
-        if self.style.code_block_overflow_x_scroll {
-            let code_block_ids = code_block_ids;
-            self.markdown.update(cx, move |markdown, _| {
-                markdown.retain_code_block_scroll_handles(&code_block_ids);
-            });
-        } else {
-            self.markdown
-                .update(cx, |markdown, _| markdown.clear_code_block_scroll_handles());
-        }
-        let mut rendered_markdown = builder.build();
-        let child_layout_id = rendered_markdown.element.request_layout(window, cx);
-        let layout_id = window.request_layout(gpui::Style::default(), [child_layout_id], cx);
-        (layout_id, rendered_markdown)
+                mermaid_state,
+            },
+        )
     }
 
     fn prepaint(
@@ -2764,18 +2760,99 @@ impl Element for MarkdownElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
-        rendered_markdown: &mut Self::RequestLayoutState,
+        layout: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
         let focus_handle = self.markdown.read(cx).focus_handle.clone();
         window.set_focus_handle(&focus_handle, cx);
         window.set_view_id(self.markdown.entity_id());
-
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        rendered_markdown.element.prepaint(window, cx);
-        self.autoscroll(&rendered_markdown.text, window, cx);
-        hitbox
+
+        let viewport = window.content_mask().bounds;
+        let visible_top = viewport.top() - BLOCK_OVERSCAN;
+        let visible_bottom = viewport.bottom() + BLOCK_OVERSCAN;
+
+        let cached_heights = self.markdown.read(cx).block_heights.clone();
+        let available = gpui::size(
+            gpui::AvailableSpace::Definite(bounds.size.width),
+            gpui::AvailableSpace::MinContent,
+        );
+
+        let mut code_block_ids = HashSet::default();
+        let mut blocks = Vec::new();
+        let mut lines = Vec::new();
+        let mut links = Vec::new();
+        let mut footnote_refs = Vec::new();
+        let mut measured = Vec::new();
+
+        let mut y = bounds.top();
+        for (index, segment) in layout.segments.iter().enumerate() {
+            let height = cached_heights
+                .get(index)
+                .copied()
+                .flatten()
+                .unwrap_or(ESTIMATED_BLOCK_HEIGHT);
+            let block_top = y;
+            if block_top + height >= visible_top && block_top <= visible_bottom {
+                // On-screen: build, lay out, and position this block.
+                let mut builder = MarkdownElementBuilder::new(
+                    &self.style.container_style,
+                    self.style.base_text_style.clone(),
+                    self.style.syntax.clone(),
+                );
+                self.build_events(
+                    &mut builder,
+                    &layout.parsed_markdown,
+                    segment.clone(),
+                    &layout.images,
+                    layout.active_root_block,
+                    layout.markdown_end,
+                    layout.render_mermaid_diagrams,
+                    &layout.mermaid_state,
+                    &mut code_block_ids,
+                    window,
+                    cx,
+                );
+                let mut rendered = builder.build();
+                let measured_size = rendered.element.layout_as_root(available, window, cx);
+                rendered
+                    .element
+                    .prepaint_at(point(bounds.left(), block_top), window, cx);
+                measured.push((index, measured_size.height));
+                lines.extend(rendered.text.lines.iter().cloned());
+                links.extend(rendered.text.links.iter().cloned());
+                footnote_refs.extend(rendered.text.footnote_refs.iter().cloned());
+                blocks.push(rendered.element);
+                y = block_top + measured_size.height;
+                #[cfg(test)]
+                BLOCKS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                y = block_top + height;
+            }
+        }
+
+        if !measured.is_empty() {
+            self.markdown.update(cx, |markdown, _| {
+                for (index, height) in measured {
+                    if let Some(slot) = markdown.block_heights.get_mut(index) {
+                        *slot = Some(height);
+                    }
+                }
+            });
+        }
+
+        let text = RenderedText {
+            lines: lines.into(),
+            links: links.into(),
+            footnote_refs: footnote_refs.into(),
+        };
+        self.autoscroll(&text, window, cx);
+        MarkdownPrepaint {
+            blocks,
+            text,
+            hitbox,
+        }
     }
 
     fn paint(
@@ -2783,8 +2860,8 @@ impl Element for MarkdownElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&gpui::InspectorElementId>,
         _bounds: Bounds<Pixels>,
-        rendered_markdown: &mut Self::RequestLayoutState,
-        hitbox: &mut Self::PrepaintState,
+        _layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -2793,7 +2870,7 @@ impl Element for MarkdownElement {
         window.set_key_context(context);
         window.on_action(std::any::TypeId::of::<crate::Copy>(), {
             let entity = self.markdown.clone();
-            let text = rendered_markdown.text.clone();
+            let text = prepaint.text.clone();
             move |_, phase, window, cx| {
                 let text = text.clone();
                 if phase == DispatchPhase::Bubble {
@@ -2810,11 +2887,34 @@ impl Element for MarkdownElement {
             }
         });
 
-        self.paint_mouse_listeners(hitbox, &rendered_markdown.text, window, cx);
-        rendered_markdown.element.paint(window, cx);
-        self.paint_search_highlights(&rendered_markdown.text, window, cx);
-        self.paint_selection(&rendered_markdown.text, window, cx);
+        self.paint_mouse_listeners(&prepaint.hitbox, &prepaint.text, window, cx);
+        for block in &mut prepaint.blocks {
+            block.paint(window, cx);
+        }
+        self.paint_search_highlights(&prepaint.text, window, cx);
+        self.paint_selection(&prepaint.text, window, cx);
     }
+}
+
+/// The document split into per-block segments plus the context needed to build
+/// each on demand. `request_layout` produces this without building anything;
+/// `prepaint` builds only the on-screen segments.
+pub struct MarkdownLayout {
+    parsed_markdown: ParsedMarkdown,
+    segments: Vec<Range<usize>>,
+    images: HashMap<usize, Arc<Image>>,
+    active_root_block: Option<usize>,
+    markdown_end: usize,
+    render_mermaid_diagrams: bool,
+    mermaid_state: MermaidState,
+}
+
+/// The on-screen blocks built this frame, plus the assembled `RenderedText`
+/// (visible lines/links/footnotes) used for selection, search, and hit-testing.
+pub struct MarkdownPrepaint {
+    blocks: Vec<AnyElement>,
+    text: RenderedText,
+    hitbox: Hitbox,
 }
 
 /// Estimated height of a not-yet-measured markdown block, used to size the cheap
@@ -2825,104 +2925,13 @@ const ESTIMATED_BLOCK_HEIGHT: Pixels = px(40.);
 /// scrolls don't reveal unpainted gaps.
 const BLOCK_OVERSCAN: Pixels = px(800.);
 
-/// Counts how many top-level blocks were actually laid out (i.e. on-screen) in
-/// the current draw, so tests can assert layout cost is bounded by the viewport
-/// rather than the document length.
+/// Counts how many top-level blocks were actually built (i.e. on-screen) in the
+/// current draw, so tests can assert per-frame build cost is bounded by the
+/// viewport rather than the document length (#57349).
 #[cfg(test)]
-pub(crate) static BLOCKS_LAID_OUT: std::sync::atomic::AtomicUsize =
+pub(crate) static BLOCKS_BUILT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Wraps a single top-level markdown block and defers its (expensive) layout and
-/// paint to `prepaint`, doing them only when the block intersects the visible
-/// `content_mask`. Off-screen blocks contribute a single cheap leaf node, so
-/// per-frame taffy work is bounded by the viewport rather than the document
-/// length (issue #57349).
-struct CulledBlock {
-    child: AnyElement,
-    height_hint: Pixels,
-}
-
-impl CulledBlock {
-    fn new(child: AnyElement) -> Self {
-        Self {
-            child,
-            height_hint: ESTIMATED_BLOCK_HEIGHT,
-        }
-    }
-}
-
-impl Element for CulledBlock {
-    type RequestLayoutState = ();
-    type PrepaintState = bool;
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (gpui::LayoutId, ()) {
-        let mut style = gpui::Style::default();
-        style.size.width = Length::Definite(gpui::relative(1.));
-        style.size.height = Length::Definite(self.height_hint.into());
-        (window.request_layout(style, [], cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut (),
-        window: &mut Window,
-        cx: &mut App,
-    ) -> bool {
-        let visible = window.content_mask().bounds.dilate(BLOCK_OVERSCAN);
-        if !bounds.intersects(&visible) {
-            return false;
-        }
-        #[cfg(test)]
-        BLOCKS_LAID_OUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let available = gpui::size(
-            gpui::AvailableSpace::Definite(bounds.size.width),
-            gpui::AvailableSpace::MinContent,
-        );
-        self.child.layout_as_root(available, window, cx);
-        self.child.prepaint_at(bounds.origin, window, cx);
-        true
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        _bounds: Bounds<Pixels>,
-        _request_layout: &mut (),
-        visible: &mut bool,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        if *visible {
-            self.child.paint(window, cx);
-        }
-    }
-}
-
-impl IntoElement for CulledBlock {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
 
 fn collect_image_alt_text(
     events_from_image_start: &[(Range<usize>, MarkdownEvent)],
@@ -3349,13 +3358,7 @@ impl MarkdownElementBuilder {
     fn pop_div(&mut self) {
         self.flush_text();
         let div = self.div_stack.pop().unwrap().into_any_element();
-        if self.div_stack.len() == 1 {
-            // Top-level block: wrap it so off-screen blocks skip layout/paint.
-            let block = CulledBlock::new(div).into_any_element();
-            self.div_stack.last_mut().unwrap().extend(iter::once(block));
-        } else {
-            self.div_stack.last_mut().unwrap().extend(iter::once(div));
-        }
+        self.div_stack.last_mut().unwrap().extend(iter::once(div));
     }
 
     fn push_sourced_element(&mut self, source_range: Range<usize>, element: impl Into<AnyElement>) {
@@ -3575,6 +3578,7 @@ impl MarkdownElementBuilder {
     }
 }
 
+#[derive(Clone)]
 struct RenderedLine {
     layout: TextLayout,
     source_mappings: Vec<SourceMapping>,
@@ -4161,7 +4165,7 @@ mod tests {
 
     /// Per-frame draw cost of an N-block markdown doc drawn in a fixed clipped
     /// viewport, plus how many top-level blocks were actually laid out in the
-    /// final frame (the deterministic measure of viewport culling).
+    /// final frame (blocks actually built — the deterministic measure of viewport culling).
     fn measure_markdown_draw(
         blocks: usize,
         cx: &mut TestAppContext,
@@ -4206,9 +4210,9 @@ mod tests {
         }
         let per_frame = start.elapsed() / iterations;
 
-        BLOCKS_LAID_OUT.store(0, std::sync::atomic::Ordering::Relaxed);
+        BLOCKS_BUILT.store(0, std::sync::atomic::Ordering::Relaxed);
         draw(&mut cx);
-        let laid_out = BLOCKS_LAID_OUT.load(std::sync::atomic::Ordering::Relaxed);
+        let laid_out = BLOCKS_BUILT.load(std::sync::atomic::Ordering::Relaxed);
         (per_frame, laid_out)
     }
 
@@ -4220,8 +4224,8 @@ mod tests {
         let (small_time, small_n) = measure_markdown_draw(150, cx);
         let (large_time, large_n) = measure_markdown_draw(1500, cx);
         println!(
-            "markdown draw/frame: 150 blocks = {small_time:?} ({small_n} laid out), \
-             1500 blocks = {large_time:?} ({large_n} laid out)"
+            "markdown draw/frame: 150 blocks = {small_time:?} ({small_n} built), \
+             1500 blocks = {large_time:?} ({large_n} built)"
         );
         // The deterministic invariant: layout is bounded by the viewport, so a
         // 10x larger document lays out the same (bounded) number of blocks, not
@@ -4257,8 +4261,8 @@ mod tests {
         let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
         cx.run_until_parked();
 
-        BLOCKS_LAID_OUT.store(0, std::sync::atomic::Ordering::Relaxed);
-        let (rendered, _) = cx.draw(Default::default(), size(px(800.), px(600.)), |_, _| {
+        BLOCKS_BUILT.store(0, std::sync::atomic::Ordering::Relaxed);
+        let (_, rendered) = cx.draw(Default::default(), size(px(800.), px(600.)), |_, _| {
             MarkdownElement::new(markdown.clone(), MarkdownStyle::default()).code_block_renderer(
                 CodeBlockRenderer::Default {
                     copy_button_visibility: CopyButtonVisibility::Hidden,
@@ -4269,7 +4273,7 @@ mod tests {
         });
         // Guard against a vacuous test: culling must actually have happened.
         assert!(
-            BLOCKS_LAID_OUT.load(std::sync::atomic::Ordering::Relaxed) < 2000,
+            BLOCKS_BUILT.load(std::sync::atomic::Ordering::Relaxed) < 2000,
             "culling didn't engage, so this test wouldn't exercise the crash"
         );
 
@@ -4307,7 +4311,7 @@ mod tests {
         // hit-test the center of the 600px viewport and check whether a position
         // near the very end of the message has geometry.
         let mut sample = |scroll: f32| -> (usize, bool) {
-            let (rendered, _) =
+            let (_, rendered) =
                 cx.draw(point(px(0.), px(-scroll)), size(px(800.), px(600.)), |_, _| {
                     MarkdownElement::new(markdown.clone(), MarkdownStyle::default())
                         .code_block_renderer(CodeBlockRenderer::Default {
@@ -4586,7 +4590,7 @@ mod tests {
         let (_, cx) = cx.add_window_view(|_, _| TestWindow);
         let markdown = cx.new(|cx| Markdown::new(markdown.to_string().into(), None, None, cx));
         cx.run_until_parked();
-        let (rendered, _) = cx.draw(
+        let (_, rendered) = cx.draw(
             Default::default(),
             size(px(600.0), px(600.0)),
             |_window, _cx| {
@@ -4637,7 +4641,7 @@ mod tests {
             )
         });
         cx.run_until_parked();
-        let (rendered, _) = cx.draw(
+        let (_, rendered) = cx.draw(
             Default::default(),
             size(px(600.0), px(600.0)),
             |_window, _cx| {
