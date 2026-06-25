@@ -3,9 +3,9 @@ use gpui::SharedString;
 use linkify::LinkFinder;
 pub use pulldown_cmark::TagEnd as MarkdownTagEnd;
 use pulldown_cmark::{
-    Alignment, CowStr, HeadingLevel, LinkType, MetadataBlockKind, Options, Parser,
+    Alignment, BrokenLink, CowStr, HeadingLevel, LinkType, MetadataBlockKind, Options, Parser,
 };
-use std::{ops::Range, sync::Arc};
+use std::{cell::RefCell, ops::Range, rc::Rc, sync::Arc};
 use util::markdown::generate_heading_slug;
 
 use crate::{html, path_range::PathWithRange};
@@ -40,6 +40,11 @@ pub(crate) struct ParsedMarkdownData {
     pub metadata_blocks: BTreeMap<usize, ParsedMetadataBlock>,
     pub heading_slugs: HashMap<SharedString, usize>,
     pub footnote_definitions: HashMap<SharedString, usize>,
+    /// Source offsets (`root_block_starts` values) of blocks that contain an
+    /// unresolved reference link/image, whose render can change when a later
+    /// chunk defines the reference. Their measured heights must not be reused
+    /// across reparses (#57349).
+    pub reparsable_blocks: HashSet<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -228,9 +233,24 @@ pub(crate) fn parse_markdown_with_options(
     } else {
         PARSE_OPTIONS
     };
-    let mut parser = Parser::new_ext(text, parse_options)
-        .into_offset_iter()
-        .peekable();
+    // Collect the source spans of unresolved reference links/images. A later
+    // chunk that defines the reference rewrites these spans (literal -> link)
+    // without changing the block's source range, so blocks containing one must
+    // not have their measured height reused across reparses (#57349).
+    let broken_link_spans = Rc::new(RefCell::new(Vec::<Range<usize>>::new()));
+    let mut parser = {
+        let broken_link_spans = broken_link_spans.clone();
+        Parser::new_with_broken_link_callback(
+            text,
+            parse_options,
+            Some(move |link: BrokenLink<'_>| -> Option<(CowStr<'_>, CowStr<'_>)> {
+                broken_link_spans.borrow_mut().push(link.span);
+                None
+            }),
+        )
+    }
+    .into_offset_iter()
+    .peekable();
     while let Some((pulldown_event, range)) = parser.next() {
         if within_metadata && !parse_metadata_blocks {
             if let pulldown_cmark::Event::End(pulldown_cmark::TagEnd::MetadataBlock(_)) =
@@ -640,6 +660,18 @@ pub(crate) fn parse_markdown_with_options(
     };
     let footnote_definitions = build_footnote_definitions(&state.events);
 
+    // Map each unresolved-reference span to the root block that contains it.
+    let reparsable_blocks: HashSet<usize> = broken_link_spans
+        .borrow()
+        .iter()
+        .filter_map(|span| {
+            let index = state
+                .root_block_starts
+                .partition_point(|&start| start <= span.start);
+            index.checked_sub(1).map(|i| state.root_block_starts[i])
+        })
+        .collect();
+
     ParsedMarkdownData {
         events: state.events,
         language_names,
@@ -649,6 +681,7 @@ pub(crate) fn parse_markdown_with_options(
         metadata_blocks,
         heading_slugs,
         footnote_definitions,
+        reparsable_blocks,
     }
 }
 

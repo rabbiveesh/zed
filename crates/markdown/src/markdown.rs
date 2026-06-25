@@ -395,10 +395,12 @@ pub struct Markdown {
     context_menu_selected_text: Option<String>,
     search_highlights: Vec<Range<usize>>,
     active_search_highlight: Option<usize>,
-    /// Measured height of each top-level block (by segment index), cached across
-    /// frames so the renderer can size the document and position off-screen
-    /// blocks without laying them out. Reset on reparse (#57349).
-    block_heights: Vec<Option<Pixels>>,
+    /// Measured height of each block, keyed by its source range so the cache
+    /// survives append-only reparses — only the changed tail blocks get new
+    /// ranges. Lets the renderer size the document and position off-screen
+    /// blocks without laying them out (#57349). Blocks with an unresolved
+    /// reference (`reparsable_blocks`) are intentionally never stored here.
+    block_heights: HashMap<Range<usize>, Pixels>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -591,7 +593,7 @@ impl Markdown {
             context_menu_selected_text: None,
             search_highlights: Vec::new(),
             active_search_highlight: None,
-            block_heights: Vec::new(),
+            block_heights: HashMap::default(),
         };
         this.parse(cx);
         this
@@ -932,6 +934,7 @@ impl Markdown {
                         mermaid_diagrams: BTreeMap::default(),
                         heading_slugs: HashMap::default(),
                         footnote_definitions: HashMap::default(),
+                        reparsable_blocks: HashSet::default(),
                     },
                     Default::default(),
                 );
@@ -951,6 +954,7 @@ impl Markdown {
             let metadata_blocks = parsed.metadata_blocks;
             let heading_slugs = parsed.heading_slugs;
             let footnote_definitions = parsed.footnote_definitions;
+            let reparsable_blocks = parsed.reparsable_blocks;
             let mermaid_diagrams = if should_render_mermaid_diagrams {
                 extract_mermaid_diagrams(&source, &events)
             } else {
@@ -1020,6 +1024,7 @@ impl Markdown {
                     mermaid_diagrams,
                     heading_slugs,
                     footnote_definitions,
+                    reparsable_blocks,
                 },
                 images_by_source_offset,
             )
@@ -1030,7 +1035,6 @@ impl Markdown {
 
             this.update(cx, |this, cx| {
                 this.parsed_markdown = parsed;
-                this.block_heights.clear();
                 let code_block_ids = this
                     .parsed_markdown
                     .events
@@ -1160,6 +1164,10 @@ pub struct ParsedMarkdown {
     pub(crate) mermaid_diagrams: BTreeMap<usize, ParsedMarkdownMermaidDiagram>,
     pub heading_slugs: HashMap<SharedString, usize>,
     pub footnote_definitions: HashMap<SharedString, usize>,
+    /// Source offsets of blocks containing an unresolved reference link/image,
+    /// whose render can change when a later chunk defines the reference. Their
+    /// heights are never cached across reparses (#57349).
+    pub(crate) reparsable_blocks: HashSet<usize>,
 }
 
 impl ParsedMarkdown {
@@ -1948,20 +1956,13 @@ impl MarkdownElement {
             .base_text_style
             .line_height_in_pixels(window.rem_size());
         let mut y = bounds.top();
-        for (index, segment) in layout.segments.iter().enumerate() {
-            let source_start = layout.parsed_markdown.events.get(segment.start)?.0.start;
-            let source_end = layout
-                .parsed_markdown
-                .events
-                .get(segment.end.saturating_sub(1))?
-                .0
-                .end;
+        for segment in &layout.segments {
+            let range = segment_source_range(&layout.parsed_markdown.events, segment);
             let height = block_heights
-                .get(index)
+                .get(&range)
                 .copied()
-                .flatten()
                 .unwrap_or(ESTIMATED_BLOCK_HEIGHT);
-            if (source_start..source_end).contains(&source_index) {
+            if range.contains(&source_index) {
                 return Some((point(bounds.left(), y), line_height));
             }
             y += height;
@@ -2789,16 +2790,19 @@ impl Element for MarkdownElement {
 
         // Size the element from cached block heights (estimating the unmeasured
         // ones) so the scroll extent is right without laying anything out.
-        let total_height = self.markdown.update(cx, |markdown, _| {
-            if markdown.block_heights.len() != segments.len() {
-                markdown.block_heights = vec![None; segments.len()];
-            }
-            markdown
-                .block_heights
+        let total_height = {
+            let block_heights = &self.markdown.read(cx).block_heights;
+            segments
                 .iter()
-                .map(|height| height.unwrap_or(ESTIMATED_BLOCK_HEIGHT))
+                .map(|segment| {
+                    let range = segment_source_range(&parsed_markdown.events, segment);
+                    block_heights
+                        .get(&range)
+                        .copied()
+                        .unwrap_or(ESTIMATED_BLOCK_HEIGHT)
+                })
                 .sum::<Pixels>()
-        });
+        };
 
         let mut style = gpui::Style::default();
         style.size.width = Length::Definite(gpui::relative(1.));
@@ -2850,11 +2854,11 @@ impl Element for MarkdownElement {
         let mut measured = Vec::new();
 
         let mut y = bounds.top();
-        for (index, segment) in layout.segments.iter().enumerate() {
+        for segment in &layout.segments {
+            let range = segment_source_range(&layout.parsed_markdown.events, segment);
             let height = cached_heights
-                .get(index)
+                .get(&range)
                 .copied()
-                .flatten()
                 .unwrap_or(ESTIMATED_BLOCK_HEIGHT);
             let block_top = y;
             if block_top + height >= visible_top && block_top <= visible_bottom {
@@ -2882,7 +2886,15 @@ impl Element for MarkdownElement {
                 rendered
                     .element
                     .prepaint_at(point(bounds.left(), block_top), window, cx);
-                measured.push((index, measured_size.height));
+                // Cache the measured height unless a later reference definition
+                // could rewrite this block's render (#57349).
+                if !layout
+                    .parsed_markdown
+                    .reparsable_blocks
+                    .contains(&range.start)
+                {
+                    measured.push((range.clone(), measured_size.height));
+                }
                 lines.extend(rendered.text.lines.iter().cloned());
                 links.extend(rendered.text.links.iter().cloned());
                 footnote_refs.extend(rendered.text.footnote_refs.iter().cloned());
@@ -2897,10 +2909,8 @@ impl Element for MarkdownElement {
 
         if !measured.is_empty() {
             self.markdown.update(cx, |markdown, _| {
-                for (index, height) in measured {
-                    if let Some(slot) = markdown.block_heights.get_mut(index) {
-                        *slot = Some(height);
-                    }
+                for (range, height) in measured {
+                    markdown.block_heights.insert(range, height);
                 }
             });
         }
@@ -2989,6 +2999,21 @@ const ESTIMATED_BLOCK_HEIGHT: Pixels = px(40.);
 /// How far above/below the visible viewport to keep blocks laid out, so quick
 /// scrolls don't reveal unpainted gaps.
 const BLOCK_OVERSCAN: Pixels = px(800.);
+
+/// The source byte range spanned by a segment's events — the key the height
+/// cache uses so a measurement survives append-only reparses (#57349).
+fn segment_source_range(
+    events: &[(Range<usize>, MarkdownEvent)],
+    segment: &Range<usize>,
+) -> Range<usize> {
+    let start = events.get(segment.start).map_or(0, |(range, _)| range.start);
+    let end = segment
+        .end
+        .checked_sub(1)
+        .and_then(|index| events.get(index))
+        .map_or(start, |(range, _)| range.end);
+    start..end
+}
 
 // Counts how many top-level blocks were actually built (i.e. on-screen) in the
 // current draw, so tests can assert per-frame build cost is bounded by the
@@ -4674,6 +4699,207 @@ mod tests {
         assert!(
             after < before - px(1000.),
             "autoscroll did not reveal the off-screen match: {before:?} -> {after:?}"
+        );
+    }
+
+    // Investigation (#57349, height-cache reuse): how much does a streaming
+    // reparse actually churn root-block ranges? If churn stays near the tail we
+    // can preserve measured heights across reparses instead of nuking them.
+    // Run with: cargo test -p markdown streaming_reparse_block_churn -- --nocapture
+    #[test]
+    fn streaming_reparse_block_churn() {
+        // Long-distance constructs: reference-style links and footnotes whose
+        // DEFINITIONS land at the very tail, long after the references up top.
+        // A late definition can change an earlier block's *render* while leaving
+        // its source range identical — which a range-keyed height cache would
+        // silently miss. We fingerprint each block's events to catch that.
+        let mut doc = String::new();
+        doc.push_str("Intro that references [the docs][site] and a fact[^note].\n\n");
+        doc.push_str("Second para with another [link][site] and a footnote[^two].\n\n");
+        for i in 0..120 {
+            match i % 4 {
+                0 => doc.push_str(&format!("## Section {i}\n\n")),
+                1 => doc.push_str(&format!("Filler paragraph {i} with words to wrap.\n\n")),
+                2 => {
+                    doc.push_str("```rust\n");
+                    for l in 0..15 {
+                        doc.push_str(&format!("    let v{l} = {i};\n"));
+                    }
+                    doc.push_str("```\n\n");
+                }
+                _ => doc.push_str("| a | b |\n|---|---|\n| 1 | 2 |\n\n"),
+            }
+        }
+        // Definitions resolve the references from the very top:
+        doc.push_str("[site]: https://example.com\n");
+        doc.push_str("[^note]: the footnote body.\n");
+        doc.push_str("[^two]: the second footnote.\n");
+
+        let chunk = 400usize;
+        // (block source range) -> debug fingerprint of the events inside it.
+        let fingerprints = |starts: &[usize],
+                            events: &[(Range<usize>, MarkdownEvent)],
+                            end: usize|
+         -> Vec<(Range<usize>, String)> {
+            starts
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    let e = starts.get(i + 1).copied().unwrap_or(end);
+                    let block: Vec<_> =
+                        events.iter().filter(|(r, _)| r.start >= s && r.start < e).collect();
+                    (s..e, format!("{block:?}"))
+                })
+                .collect()
+        };
+
+        let mut prev: Vec<(Range<usize>, String)> = Vec::new();
+        let mut reparses = 0usize;
+        let mut max_range_churn_depth = 0usize;
+        let mut stable_range_render_changes = 0usize; // the dangerous case
+        let mut pos = chunk;
+        loop {
+            let mut end = pos.min(doc.len());
+            while end < doc.len() && !doc.is_char_boundary(end) {
+                end += 1;
+            }
+            let prefix = &doc[..end];
+            let parsed = parse_markdown_with_options(prefix, true, true, true);
+            let now = fingerprints(&parsed.root_block_starts, &parsed.events, prefix.len());
+            if !prev.is_empty() {
+                let now_ranges: HashSet<Range<usize>> =
+                    now.iter().map(|(r, _)| r.clone()).collect();
+                let now_by_range: HashMap<Range<usize>, &String> =
+                    now.iter().map(|(r, f)| (r.clone(), f)).collect();
+                if let Some(min_dropped) = prev
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (r, _))| !now_ranges.contains(r))
+                    .map(|(i, _)| i)
+                    .min()
+                {
+                    max_range_churn_depth = max_range_churn_depth.max(prev.len() - min_dropped);
+                }
+                // Identical source range, different rendered events == a height
+                // a range-keyed cache would wrongly keep.
+                for (idx, (range, old_fp)) in prev.iter().enumerate() {
+                    if let Some(new_fp) = now_by_range.get(range)
+                        && *new_fp != old_fp
+                    {
+                        stable_range_render_changes += 1;
+                        println!(
+                            "reparse {reparses}: block {idx}/{} (range {range:?}) SAME RANGE, render changed",
+                            prev.len(),
+                        );
+                    }
+                }
+            }
+            prev = now;
+            reparses += 1;
+            if end >= doc.len() {
+                break;
+            }
+            pos += chunk;
+        }
+        println!(
+            "=== {reparses} reparses | max range-churn depth {max_range_churn_depth} | \
+             stable-range render changes (range-key would miss): {stable_range_render_changes} ==="
+        );
+        // Range churn stays at the tail, so range-keyed height reuse is safe for
+        // the append-only bulk.
+        assert!(
+            max_range_churn_depth <= 3,
+            "range churn reached {max_range_churn_depth} blocks from the end; \
+             range-keyed reuse would drop measured heights it shouldn't"
+        );
+        // But reference definitions DO rewrite earlier blocks at a stable source
+        // range — which is exactly why those blocks need the `reparsable` flag
+        // and must not have their heights reused (#57349).
+        assert!(
+            stable_range_render_changes > 0,
+            "expected a reference definition to change an earlier block at a stable range"
+        );
+    }
+
+    #[test]
+    fn unresolved_reference_flags_block_as_reparsable() {
+        let unresolved =
+            parse_markdown_with_options("Text with [a link][ref] inside.", true, false, false);
+        assert!(
+            !unresolved.reparsable_blocks.is_empty(),
+            "an unresolved reference should flag its block"
+        );
+
+        let resolved = parse_markdown_with_options(
+            "Text with [a link][ref] inside.\n\n[ref]: https://example.com",
+            true,
+            false,
+            false,
+        );
+        assert!(
+            resolved.reparsable_blocks.is_empty(),
+            "a resolved reference should not flag its block"
+        );
+    }
+
+    /// C (#57349): a block measured before an append-only reparse keeps its
+    /// cached height afterward — even while off-screen — instead of being nuked.
+    #[gpui::test]
+    fn height_cache_survives_append_reparse(cx: &mut TestAppContext) {
+        struct TestWindow;
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        ensure_theme_initialized(cx);
+        let markdown = cx.new(|cx| Markdown::new(perf_doc(30).into(), None, None, cx));
+        let (_, mut cx) = cx.add_window_view(|_, _| TestWindow);
+        cx.simulate_resize(size(px(800.), px(600.)));
+        cx.run_until_parked();
+
+        let viewport = size(px(800.), px(600.));
+        let draw = |cx: &mut gpui::VisualTestContext, markdown: &Entity<Markdown>, scroll: f32| {
+            let markdown = markdown.clone();
+            cx.draw(point(px(0.), px(-scroll)), viewport, move |_, _| {
+                MarkdownElement::new(markdown.clone(), MarkdownStyle::default()).code_block_renderer(
+                    CodeBlockRenderer::Default {
+                        copy_button_visibility: CopyButtonVisibility::Hidden,
+                        wrap_button_visibility: WrapButtonVisibility::Hidden,
+                        border: false,
+                    },
+                )
+            });
+        };
+
+        // Measure the top blocks (scroll 0).
+        draw(&mut cx, &markdown, 0.0);
+        let top_block = cx.update(|_, cx| {
+            markdown
+                .read(cx)
+                .block_heights
+                .iter()
+                .min_by_key(|(range, _)| range.start)
+                .map(|(range, height)| (range.clone(), *height))
+                .expect("top blocks should have been measured")
+        });
+
+        // Append more content (append-only reparse), then redraw scrolled far
+        // down so the top block is off-screen and is NOT re-measured this frame.
+        cx.update(|_, cx| {
+            markdown.update(cx, |markdown, cx| {
+                markdown.append("\n\n## a freshly appended heading\n\n", cx)
+            })
+        });
+        cx.run_until_parked();
+        draw(&mut cx, &markdown, 5000.0);
+
+        let (range, height) = top_block;
+        let survived = cx.update(|_, cx| markdown.read(cx).block_heights.get(&range).copied());
+        assert_eq!(
+            survived,
+            Some(height),
+            "the top block's measured height was lost across the reparse"
         );
     }
 
