@@ -1970,6 +1970,74 @@ impl MarkdownElement {
         None
     }
 
+    /// Lay out (off-screen, no paint) any not-yet-measured blocks before
+    /// `source_index` and cache their heights, so a scroll-to that target is
+    /// exact even when the intervening content streamed in without ever being
+    /// rendered. Only unmeasured blocks are touched, and the measurements
+    /// persist, so a repeat scroll-to is free (B1, #57349).
+    fn measure_blocks_above(
+        &self,
+        layout: &MarkdownLayout,
+        bounds: Bounds<Pixels>,
+        source_index: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let mut to_measure = Vec::new();
+        {
+            let block_heights = &self.markdown.read(cx).block_heights;
+            for segment in &layout.segments {
+                let range = segment_source_range(&layout.parsed_markdown.events, segment);
+                if range.contains(&source_index) {
+                    break;
+                }
+                if !block_heights.contains_key(&range)
+                    && !layout.parsed_markdown.reparsable_blocks.contains(&range.start)
+                {
+                    to_measure.push((segment.clone(), range));
+                }
+            }
+        }
+        if to_measure.is_empty() {
+            return;
+        }
+
+        let available = gpui::size(
+            gpui::AvailableSpace::Definite(bounds.size.width),
+            gpui::AvailableSpace::MinContent,
+        );
+        let mut code_block_ids = HashSet::default();
+        let mut measured = Vec::new();
+        for (segment, range) in to_measure {
+            let mut builder = MarkdownElementBuilder::new(
+                &self.style.container_style,
+                self.style.base_text_style.clone(),
+                self.style.syntax.clone(),
+            );
+            self.build_events(
+                &mut builder,
+                &layout.parsed_markdown,
+                segment,
+                &layout.images,
+                layout.active_root_block,
+                layout.markdown_end,
+                layout.render_mermaid_diagrams,
+                &layout.mermaid_state,
+                &mut code_block_ids,
+                window,
+                cx,
+            );
+            let mut rendered = builder.build();
+            let size = rendered.element.layout_as_root(available, window, cx);
+            measured.push((range, size.height));
+        }
+        self.markdown.update(cx, |markdown, _| {
+            for (range, height) in measured {
+                markdown.block_heights.insert(range, height);
+            }
+        });
+    }
+
     fn autoscroll(
         &self,
         layout: &MarkdownLayout,
@@ -1981,9 +2049,12 @@ impl MarkdownElement {
         let autoscroll_index = self
             .markdown
             .update(cx, |markdown, _| markdown.autoscroll_request.take())?;
-        // Use the exact position when the target is on screen; otherwise the
-        // target block was culled, so estimate its position from the cached
-        // per-block heights — enough to scroll it into view (#57349).
+        // Measure any not-yet-measured blocks above the target so its position is
+        // exact — even for content that streamed in off-screen and was never
+        // rendered, so its height was never cached (B1, #57349).
+        self.measure_blocks_above(layout, bounds, autoscroll_index, window, cx);
+        // Exact position if the target is on screen; otherwise compute it from
+        // the (now fully measured) per-block heights.
         let (position, line_height) = rendered_text
             .position_for_source_index(autoscroll_index)
             .or_else(|| {
@@ -4963,6 +5034,52 @@ mod tests {
             after >= before - px(1.),
             "scroll extent collapsed across the reparse: {before:?} -> {after:?} \
              (off-screen heights were not preserved)"
+        );
+    }
+
+    /// B1 (#57349): scrolling to a target in content that streamed in off-screen
+    /// (never rendered → never measured) lays out the intervening blocks on
+    /// demand, so the jump is exact instead of landing short on estimates.
+    #[gpui::test]
+    fn autoscroll_measures_never_rendered_blocks(cx: &mut TestAppContext) {
+        struct TestWindow;
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        ensure_theme_initialized(cx);
+        // Tall doc: at scroll 0 only the first ~30 blocks fall in the viewport +
+        // overscan, so blocks deep in the document are never measured.
+        let markdown = cx.new(|cx| Markdown::new(perf_doc(100).into(), None, None, cx));
+        let (_, mut cx) = cx.add_window_view(|_, _| TestWindow);
+        cx.simulate_resize(size(px(800.), px(600.)));
+        cx.run_until_parked();
+
+        let target = cx.update(|_, cx| markdown.read(cx).parsed_markdown.root_block_starts[90]);
+        cx.update(|_, cx| {
+            markdown.update(cx, |markdown, cx| {
+                markdown.request_autoscroll_to_source_index(target, cx)
+            })
+        });
+
+        // One draw at the top: autoscroll fires and B1 measures the unmeasured
+        // blocks above the target, even though they're far off-screen.
+        let markdown_for_draw = markdown.clone();
+        cx.draw(point(px(0.), px(0.)), size(px(800.), px(600.)), move |_, _| {
+            MarkdownElement::new(markdown_for_draw.clone(), MarkdownStyle::default())
+                .code_block_renderer(CodeBlockRenderer::Default {
+                    copy_button_visibility: CopyButtonVisibility::Hidden,
+                    wrap_button_visibility: WrapButtonVisibility::Hidden,
+                    border: false,
+                })
+        });
+
+        let measured = cx.update(|_, cx| markdown.read(cx).block_heights.len());
+        assert!(
+            measured >= 60,
+            "expected B1 to measure the off-screen blocks above the target on demand, \
+             only {measured} blocks measured"
         );
     }
 
