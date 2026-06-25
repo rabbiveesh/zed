@@ -4903,6 +4903,69 @@ mod tests {
         );
     }
 
+    /// C (#57349): after measuring the whole document, an append-only reparse
+    /// keeps the off-screen heights, so the scroll extent stays accurate instead
+    /// of collapsing toward the 40px estimate — which is what kept autoscroll and
+    /// the scrollbar honest mid-stream.
+    #[gpui::test]
+    fn scroll_extent_survives_reparse(cx: &mut TestAppContext) {
+        struct TestWindow;
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        ensure_theme_initialized(cx);
+        let markdown = cx.new(|cx| Markdown::new(perf_doc(40).into(), None, None, cx));
+        let (_, mut cx) = cx.add_window_view(|_, _| TestWindow);
+        cx.simulate_resize(size(px(800.), px(600.)));
+        cx.run_until_parked();
+
+        let viewport = size(px(800.), px(600.));
+        let draw = |cx: &mut gpui::VisualTestContext, markdown: &Entity<Markdown>, scroll: f32| {
+            let markdown = markdown.clone();
+            cx.draw(point(px(0.), px(-scroll)), viewport, move |_, _| {
+                MarkdownElement::new(markdown.clone(), MarkdownStyle::default()).code_block_renderer(
+                    CodeBlockRenderer::Default {
+                        copy_button_visibility: CopyButtonVisibility::Hidden,
+                        wrap_button_visibility: WrapButtonVisibility::Hidden,
+                        border: false,
+                    },
+                )
+            });
+        };
+        let extent = |cx: &mut gpui::VisualTestContext, markdown: &Entity<Markdown>| -> Pixels {
+            cx.update(|_, cx| markdown.read(cx).block_heights.values().copied().sum())
+        };
+
+        // Sweep the whole document so every block is measured.
+        for step in 0..40 {
+            draw(&mut cx, &markdown, step as f32 * 800.0);
+        }
+        let before = extent(&mut cx, &markdown);
+        assert!(
+            before > px(1000.),
+            "expected a tall fully-measured doc, got {before:?}"
+        );
+
+        // Append more content (append-only reparse). The markdown is not drawn
+        // again (the window root is empty), so nothing is re-measured — the
+        // earlier heights are kept only if they survive the reparse.
+        cx.update(|_, cx| {
+            markdown.update(cx, |markdown, cx| {
+                markdown.append("\n\n## a freshly appended heading\n\n", cx)
+            })
+        });
+        cx.run_until_parked();
+
+        let after = extent(&mut cx, &markdown);
+        assert!(
+            after >= before - px(1.),
+            "scroll extent collapsed across the reparse: {before:?} -> {after:?} \
+             (off-screen heights were not preserved)"
+        );
+    }
+
     #[gpui::test]
     fn test_mappings(cx: &mut TestAppContext) {
         // Formatting.
